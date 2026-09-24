@@ -1,0 +1,17 @@
+# yaml-language-server: $schema=https://json.schemastore.org/clang-format-21.x.json
+---
+BasedOnStyle: LLVM
+IndentWidth: 2
+ColumnLimit: 120
+IndentPPDirectives: Leave
+EnumTrailingComma: Leave
+AlignTrailingComments:
+  Kind: Always
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+AllowShortIfStatementsOnASingleLine: WithoutElse
+AllowShortLoopsOnASingleLine: true
+AlignEscapedNewlines: LeftWithLastLine
+---

@@ -1,0 +1,8 @@
+# yaml-language-server: $schema=https://json.schemastore.org/clangd.json
+CompileFlags:
+  Add: [-xc, -std=c23, -Wall, -Wno-unknown-attributes, -Wno-unknown-pragmas]
+  BuiltinHeaders: QueryDriver
+  Compiler: clang
+
+Documentation:
+  CommentFormat: Doxygen

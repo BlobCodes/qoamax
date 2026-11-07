@@ -4,18 +4,24 @@
 #include <stdint.h>
 
 #define QOAMAX_MAX_CHANNEL_COUNT 8
+#define QOAMAX_FRAME_SAMPLES 5120 //!< Samples per channel in a full frame
 
-typedef struct {
+#define QOAMAX_ERROR_INVALID_ARGUMENT -1
+#define QOAMAX_ERROR_INVALID_FILE_HEADER -2
+#define QOAMAX_ERROR_INVALID_FRAME_HEADER -3
+#define QOAMAX_ERROR_SAMPLE_FORMAT_BREAK -4
+#define QOAMAX_ERROR_UNSUPPORTED_CHANNEL_COUNT -5
+
+typedef struct [[gnu::aligned(8)]] {
   int16_t history[4];
   int32_t weights[4];
 } qoamax_lms;
 
 typedef struct {
-  qoamax_lms lms[QOAMAX_MAX_CHANNEL_COUNT];
+  int32_t samplerate;
+  uint16_t frame_samples; //!< Samples per channel left in the current frame (0 = next read is a frame header).
   uint8_t channel_count;
-  uint16_t frame_samples;
-  int slice_pos;
-  int samplerate;
+  qoamax_lms lms[QOAMAX_MAX_CHANNEL_COUNT];
 } qoamax_decoder;
 
 typedef struct {
@@ -24,28 +30,43 @@ typedef struct {
   uint8_t channel_count;
 } qoamax_decoder_query;
 
+//! The encoder effort enum specifies which algorithm and what
+//! parameters will be used for encoding the audio data.
+//!
+//! The available choices range from being as fast as the reference decoder
+//! to taking multiple hours to encode a single minute of audio.
+//!
+//! A value packs the lookahead in slices minus one (bits 0-1) and the beam width (the remaining bits, 0 = hill-climb,
+//! negative = ULTRAFAST).
 typedef enum {
-  QOAMAX_ENCODER_EFFORT_SUPERFAST = 0,                //!< Similar quality to reference encoder
-  QOAMAX_ENCODER_EFFORT_VERYFAST  = 1,                //!< Moderate quality gains at small overhead
-  QOAMAX_ENCODER_EFFORT_FAST      = 2,                //!< Moderate quality gains at medium overhead
-  QOAMAX_ENCODER_EFFORT_MEDIUM    = 3,                //!< Significant intra-slice quality gains
-  QOAMAX_ENCODER_EFFORT_SLOW      = 1 | (64 << 2),   //!< Increased horizon,
-  QOAMAX_ENCODER_EFFORT_VERYSLOW  = 1 | (1024 << 2),  //!< Large horizon,
-  QOAMAX_ENCODER_EFFORT_PLACEBO   = 3 | (1024 << 2),  //!< Maximum quality the current implementation can achieve
+  QOAMAX_ENCODER_EFFORT_ULTRAFAST = -4,              //!< Bad quality, but almost as fast as the decoder.
+  QOAMAX_ENCODER_EFFORT_SUPERFAST = 0,               //!< Similar quality to reference encoder.
+  QOAMAX_ENCODER_EFFORT_VERYFAST  = 1,               //!< Roughly 0.5dB better than SUPERFAST by increasing the
+                                                     //!  lookahead to 40 samples when encoding scalefactors.
+  QOAMAX_ENCODER_EFFORT_FAST      = 0 | (2 << 2),    //!< Roughly 1.0dB better than SUPERFAST
+                                                     //!  by greedily encoding residuals.
+  QOAMAX_ENCODER_EFFORT_MEDIUM    = 0 | (4 << 2),    //!< Roughly 1.5dB better than SUPERFAST
+                                                     //!  by more greedily encoding residuals.
+  QOAMAX_ENCODER_EFFORT_SLOW      = 1 | (4 << 2),    //!< Roughly 2.0dB better than SUPERFAST by greedily
+                                                     //!  encoding both the residuals and the scalefactor.
+  QOAMAX_ENCODER_EFFORT_VERYSLOW  = 1 | (16 << 2),   //!< Roughly 2.5dB better than SUPERFAST
+                                                     //!  by more greedily encoding residuals.
+  QOAMAX_ENCODER_EFFORT_PLACEBO   = 3 | (1024 << 2), //!< Roughly 3.0dB better than SUPERFAST.
+                                                     //!  Maximum quality the current implementation can achieve.
+                                                     //!  Can take multiple hours to encode a single minute!
 } qoamax_encoder_effort;
 
 typedef struct {
   qoamax_lms lms;
   uint8_t prev_scalefactor;
-  uint64_t cache[3];
-  uint64_t error;
+  uint64_t error; //!< Cumulative squared error of the encoded samples
 } qoamax_encoder_channel;
 
 typedef struct {
   qoamax_encoder_effort effort;
   uint32_t total_samples;
   int32_t samplerate;
-  int16_t slice_pos;
+  uint16_t frame_slices; //!< Slices per channel left in the current frame (0 = next write starts a frame).
   uint8_t channel_count;
   bool header_written;
 
@@ -65,10 +86,11 @@ typedef struct {
 //! Decodes a 64-bit slice into 20 audio samples, modifying the LMS filter's state.
 //!
 //! The function can be used to implement custom file formats, streaming, etc..
-void qoamax_decode_slice(qoamax_lms *restrict lms, uint64_t slice, int16_t out[static restrict 20]) [[unsequenced]];
+void qoamax_decode_slice(qoamax_lms *restrict lms, uint64_t slice, int16_t out[static restrict 20]);
 
 //! The core slice encoding function used in all other encoding mechanisms.
-//! Encodes the first 20 audio samples into a 64-bit slice, modifying the LMS filter's state.
+//! Encodes the first 20 audio samples (fewer at the end of the stream) into a 64-bit slice,
+//! modifying the LMS filter's state.
 //!
 //! The function can be used to implement custom file formats, for streaming, etc..
 //!
@@ -78,12 +100,14 @@ void qoamax_decode_slice(qoamax_lms *restrict lms, uint64_t slice, int16_t out[s
 //! Using a smaller samples_size is only allowed if the audio stream is about to end
 //! and thus has fewer samples than would be required by the effort.
 //!
+//! The encoder effort may not be changed during encoding. Doing so could result in a segmentation fault.
+//!
 //! @returns the encoded slice.
 uint64_t qoamax_encode_slice(qoamax_encoder_channel *restrict channel, qoamax_encoder_effort effort, int samples_size,
-                             const int16_t samples[static restrict samples_size])
-    [[unsequenced]];
+                             const int16_t samples[static restrict samples_size]);
 
-//! Returns the amount of continuous samples being looked at to produce a 64-bit slice for this effort option.
+//! Returns the amount of continuous samples @ref qoamax_encode_slice looks at to produce a 64-bit slice for this
+//! effort option (its samples_size should be at least this large, except at the end of the stream).
 [[maybe_unused]] static inline int qoamax_encoder_effort_get_lookahead(qoamax_encoder_effort effort) {
   return ((effort & 3) + 1) * 20;
 }
@@ -95,40 +119,42 @@ uint64_t qoamax_encode_slice(qoamax_encoder_channel *restrict channel, qoamax_en
 //! Initializes the decoder, reading the file's header and returning playback information.
 //!
 //! @param self      The decoder, does not need to be zeroed.
-//! @param file_size The amount of bytes that can be read from *file. Must be >=16.
+//! @param file_size The amount of bytes that can be read from *file. Must be >= 16.
 //! @param file      Mutable pointer to the file's contents.
-//! @param query     Destiny to write queried information (not null).
+//! @param query     Destination to write queried information (not null).
 //!
 //! @returns 0 on success
-int qoamax_decoder_init(qoamax_decoder *restrict self, int file_size, const char *restrict *restrict file,
-                        qoamax_decoder_query *query) [[unsequenced]];
+int qoamax_decoder_init(qoamax_decoder *restrict self, size_t file_size, const char *restrict *restrict file,
+                        qoamax_decoder_query *query);
 
 //! Continues decoding the given file, writing as many decoded samples as possible into the output buffers.
+//! Returns once the file or the output buffers run out, advancing *file and the buffer pointers.
 //!
 //! @param self                The decoder.
-//! @param file_size           The amount of bytes that can be read from *file. Must be >= 8 * channel_count.
+//! @param file_size           The amount of bytes that can be read from *file.
 //! @param file                Mutable pointer to the file's contents.
-//! @param samples_per_channel The amount of samples that can be written into each out buffer.
-//! @param out                 Array of mutable pointers to individual buffers for each channel.
+//! @param samples_per_channel The amount of samples that can be written into each buffer.
+//! @param samples             Array of mutable pointers to individual buffers for each channel.
 //!
 //! @returns 0 on success
-int qoamax_decoder_read(qoamax_decoder *restrict self, int file_size, const char *restrict *restrict file,
-                        size_t samples_per_channel, int16_t *restrict samples[static restrict self->channel_count])
-    [[unsequenced]];
+int qoamax_decoder_read(qoamax_decoder *restrict self, size_t file_size, const char *restrict *restrict file,
+                        size_t samples_per_channel, int16_t *restrict samples[static restrict self->channel_count]);
 
 //! Continues decoding the given file, writing as many decoded samples as possible into the interleaved output buffer.
+//! Returns once the file or the output buffer runs out, advancing *file and *samples.
 //!
-//! This function is slower than the non-interleaved function @ref qoamax_decoder_read.
+//! This function is slightly slower than the non-interleaved function @ref qoamax_decoder_read.
 //!
 //! @param self         The decoder.
-//! @param file_size    The amount of bytes that can be read from *file. Must be >= 8 * channel_count.
+//! @param file_size    The amount of bytes that can be read from *file.
 //! @param file         Mutable pointer to the file's contents.
-//! @param samples_size The amount of samples that can be written into each out buffer.
-//! @param out          Mutable pointer to interleaved audio buffer.
+//! @param samples_size The amount of total samples that can be written into the buffer.
+//! @param samples      Mutable pointer to the interleaved audio buffer.
 //!
 //! @returns 0 on success
-int qoamax_decoder_read_interleaved(qoamax_decoder *restrict self, int file_size, const char *restrict *restrict file,
-                                    size_t samples_size, int16_t *restrict samples[static restrict 1]) [[unsequenced]];
+int qoamax_decoder_read_interleaved(qoamax_decoder *restrict self, size_t file_size,
+                                    const char *restrict *restrict file, size_t samples_size,
+                                    int16_t *restrict samples[static restrict 1]);
 
 ////////////////////
 //    Encoder     //
@@ -138,15 +164,19 @@ int qoamax_decoder_read_interleaved(qoamax_decoder *restrict self, int file_size
 //!
 //! NOTE: channel_count must be between 1 and 8, samples_per_channel must be > 0.
 //!       The result is undefined otherwise.
-[[maybe_unused]] static inline int32_t qoamax_encoder_get_encoded_size(int32_t channel_count,
-                                                                       int32_t samples_per_channel) {
-  return 8 * (1 + ((samples_per_channel + 5119) / 5120) + channel_count * ((samples_per_channel + 19) / 20 + 2 * ((samples_per_channel + 5119) / 5120)));
+[[maybe_unused]] static inline uint64_t qoamax_encoder_get_encoded_size(int channel_count,
+                                                                        uint32_t samples_per_channel) {
+  uint64_t frames = ((uint64_t)samples_per_channel + QOAMAX_FRAME_SAMPLES - 1) / QOAMAX_FRAME_SAMPLES;
+  uint64_t slices = ((uint64_t)samples_per_channel + 19) / 20; // per channel
+
+  // The file header, a frame header plus every channel's LMS state (history, weights) per frame, and the slices.
+  return 8 * (1 + frames * (1 + 2 * channel_count) + slices * channel_count);
 }
 
 //! Initializes the encoder state, supplying it with the information
 //! required to produce headers and prepare the encoder's state.
 //!
-//! @param
+//! @param self          The encoder, does not need to be zeroed.
 //! @param effort        The chosen performance/quality tradeoff.
 //! @param channel_count The file's channel count (range 1..8).
 //! @param total_samples Audio size hint written into the file's header, may be 0 for streaming.
@@ -154,12 +184,15 @@ int qoamax_decoder_read_interleaved(qoamax_decoder *restrict self, int file_size
 //!
 //! @returns 0 on success
 int qoamax_encoder_init(qoamax_encoder *self, qoamax_encoder_effort effort, int channel_count, uint32_t total_samples,
-                        int32_t samplerate) [[unsequenced]];
+                        int32_t samplerate);
 
 //! Encodes as many audio samples as possible using the given output and input buffers.
 //!
-//! Depending on the chosen encoder effort, the encoder requires different amounts of lookahead.
-//! See @ref qoamax_encoder_effort_get_lookahead to find out how large the input buffer needs to be.
+//! Unless samples_complete is set, a frame is only started once all of its samples (QOAMAX_FRAME_SAMPLES per channel)
+//! are available, as its header holds the sample count, and a slice is only encoded once the samples the effort
+//! looks ahead are available. The encoder returns when it needs more input, so pass at least QOAMAX_FRAME_SAMPLES
+//! samples per channel to ensure progress, and pass the samples that weren't consumed again in the next call.
+//! Nothing is written for a stream without samples, as a QOA file can't be empty.
 //!
 //! Note that the input/output buffer pointers are given by non-const references,
 //! since the encoder moves them to signal encoder progress.
@@ -172,30 +205,33 @@ int qoamax_encoder_init(qoamax_encoder *self, qoamax_encoder_effort effort, int 
 //!
 //! @returns 0 on success
 int qoamax_encoder_write(qoamax_encoder *restrict self, size_t file_size, char *restrict *restrict file,
-                         int samples_per_channel, const int16_t *restrict samples[static restrict self->channel_count],
-                         bool samples_complete) [[unsequenced]];
+                         size_t samples_per_channel,
+                         const int16_t *restrict samples[static restrict self->channel_count], bool samples_complete);
 
 //! Encodes as many audio samples as possible using the given output and input buffers.
 //!
-//! Depending on the chosen encoder effort, the encoder requires different amounts of lookahead.
-//! See @ref qoamax_encoder_effort_get_lookahead to find out how large the input buffer needs to be.
+//! Unless samples_complete is set, a frame is only started once all of its samples (QOAMAX_FRAME_SAMPLES per channel)
+//! are available, as its header holds the sample count, and a slice is only encoded once the samples the effort
+//! looks ahead are available. The encoder returns when it needs more input, so pass at least QOAMAX_FRAME_SAMPLES
+//! samples per channel to ensure progress, and pass the samples that weren't consumed again in the next call.
+//! Nothing is written for a stream without samples, as a QOA file can't be empty.
 //!
 //! Note that the input/output buffer pointers are given by non-const references,
 //! since the encoder moves them to signal encoder progress.
 //!
 //! @param file_size           Amount of writable bytes in *file.
 //! @param file                Pointer to output buffer pointer.
-//! @param samples_per_channel Size of a sample buffer pointed to from samples[].
+//! @param samples_size        Amount of total samples in the interleaved buffer.
 //! @param samples             Pointer to interleaved audio sample buffer.
 //! @param samples_complete    Whether the given samples array has reached the audio file's end.
 //!
 //! @returns 0 on success
 int qoamax_encoder_write_interleaved(qoamax_encoder *restrict self, size_t file_size, char *restrict *restrict file,
-                                     int samples_size, const int16_t *restrict samples[static restrict 1],
-                                     bool samples_complete) [[unsequenced]];
+                                     size_t samples_size, const int16_t *restrict samples[static restrict 1],
+                                     bool samples_complete);
 
 //! Returns the cumulated squared error up to the current encoding position for each channel.
-[[maybe_unused]] static inline void qoamax_encoder_get_error(qoamax_encoder *self,
+[[maybe_unused]] static inline void qoamax_encoder_get_error(const qoamax_encoder *self,
                                                              uint64_t errors[static restrict self->channel_count]) {
   for (int i = 0; i < self->channel_count; i++) errors[i] = self->channels[i].error;
 }

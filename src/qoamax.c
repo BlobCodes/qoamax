@@ -1,68 +1,74 @@
-#include <errno.h>
-#include <stdbit.h>
-#include <string.h>
-
 #include "./qoamax.h"
-
-//! This flag provides a tiny performance improvement,
-//! but requires qoa files to be aligned to an 8-byte boundary.
-#define QOAMAX_FILE_ALIGNED true
+#include <string.h>
 
 ///////////////////////////////////////////////////////////////////////////////
 //                        Core De-/Encoding Functions                        //
 ///////////////////////////////////////////////////////////////////////////////
 
-typedef struct [[gnu::aligned(64)]] {
-  uint64_t error;
-  qoamax_lms lms;
-  uint64_t slices[4]; //!< Maximum lookahead of 80 samples
-} qoamax_encoder_node;
+#define QOAMAX_MAX_BEAM_WIDTH 1024    //!< Largest beam width of the encoder efforts
+#define QOAMAX_MAX_LOOKAHEAD_SLICES 4 //!< Largest lookahead of the encoder efforts (80 samples)
+// The beam search's state is sized for the efforts' small beams, so that only wide beams (PLACEBO) need large stack
+// frames (about 350 KB), in separate functions.
+#define QOAMAX_SMALL_BEAM_WIDTH 16 //!< Largest beam width with a small search state
+#define QOAMAX_SMALL_BEAM_NODES 64 //!< Most nodes of all slices of a search kept in a small stack frame
 
-static const int16_t qoamax_dqt[16][8] = {
-    {1, -1, 3, -3, 5, -5, 7, -7},
-    {5, -5, 18, -18, 32, -32, 49, -49},
-    {16, -16, 53, -53, 95, -95, 147, -147},
-    {34, -34, 113, -113, 203, -203, 315, -315},
-    {63, -63, 210, -210, 378, -378, 588, -588},
-    {104, -104, 345, -345, 621, -621, 966, -966},
-    {158, -158, 528, -528, 950, -950, 1477, -1477},
-    {228, -228, 760, -760, 1368, -1368, 2128, -2128},
-    {316, -316, 1053, -1053, 1895, -1895, 2947, -2947},
-    {422, -422, 1405, -1405, 2529, -2529, 3934, -3934},
-    {548, -548, 1828, -1828, 3290, -3290, 5117, -5117},
-    {696, -696, 2320, -2320, 4176, -4176, 6496, -6496},
-    {868, -868, 2893, -2893, 5207, -5207, 8099, -8099},
-    {1064, -1064, 3548, -3548, 6386, -6386, 9933, -9933},
-    {1286, -1286, 4288, -4288, 7718, -7718, 12005, -12005},
-    {1536, -1536, 5120, -5120, 9216, -9216, 14336, -14336},
-};
+//! The dequantization values per scalefactor. Each row (a, b, c, d) expands to the
+//! residuals {a, -a, b, -b, c, -c, d, -d}.
+#define QOAMAX_DQT_ROWS(ROW)   \
+  ROW(1, 3, 5, 7)              \
+  ROW(5, 18, 32, 49)           \
+  ROW(16, 53, 95, 147)         \
+  ROW(34, 113, 203, 315)       \
+  ROW(63, 210, 378, 588)       \
+  ROW(104, 345, 621, 966)      \
+  ROW(158, 528, 950, 1477)     \
+  ROW(228, 760, 1368, 2128)    \
+  ROW(316, 1053, 1895, 2947)   \
+  ROW(422, 1405, 2529, 3934)   \
+  ROW(548, 1828, 3290, 5117)   \
+  ROW(696, 2320, 4176, 6496)   \
+  ROW(868, 2893, 5207, 8099)   \
+  ROW(1064, 3548, 6386, 9933)  \
+  ROW(1286, 4288, 7718, 12005) \
+  ROW(1536, 5120, 9216, 14336)
 
-static const int16_t qoamax_qt[16][3] = {
-    {2, 4, 6},          {11, 25, 40},       {34, 74, 121},      {73, 158, 259},
-    {136, 294, 483},    {224, 483, 793},    {343, 739, 1213},   {494, 1064, 1748},
-    {684, 1474, 2421},  {913, 1967, 3231},  {1188, 2559, 4203}, {1508, 3248, 5336},
-    {1880, 4050, 6653}, {2306, 4967, 8159}, {2787, 6003, 9861}, {3328, 7168, 11776},
-};
+#define QOAMAX_DQT_ROW(a, b, c, d) {a, -a, b, -b, c, -c, d, -d},
+static const int16_t qoamax_dqt[16][8] = {QOAMAX_DQT_ROWS(QOAMAX_DQT_ROW)};
 
-#define qoamax_assume(x)  \
-  if (!(x)) unreachable()
+//! Dequantization table entry with the precomputed LMS weight update.
+typedef struct {
+  int32_t dequantized;
+  int32_t weight_delta[2]; //!< Indexed by 1 + (history >> 31): {-delta, +delta} for negative/positive history.
+  int32_t padding;
+} qoamax_decoder_entry;
 
-#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define QOAMAX_DECODER_ENTRY(dq) {(dq), {-((dq) >> 4), (dq) >> 4}, 0}
+#define QOAMAX_DECODER_ROW(a, b, c, d)                                                                        \
+  {QOAMAX_DECODER_ENTRY(a), QOAMAX_DECODER_ENTRY(-(a)), QOAMAX_DECODER_ENTRY(b), QOAMAX_DECODER_ENTRY(-(b)),  \
+   QOAMAX_DECODER_ENTRY(c), QOAMAX_DECODER_ENTRY(-(c)), QOAMAX_DECODER_ENTRY(d), QOAMAX_DECODER_ENTRY(-(d))},
+static const qoamax_decoder_entry qoamax_decoder_table[16][8] = {QOAMAX_DQT_ROWS(QOAMAX_DECODER_ROW)};
 
-//! Saturating conversion from int32_t to int16_t.
+//! The quantization thresholds per scalefactor: the midpoints between neighbouring dequantization magnitudes.
+#define QOAMAX_QT_ROW(a, b, c, d) {((a) + (b)) / 2, ((b) + (c)) / 2, ((c) + (d)) / 2},
+static const int16_t qoamax_qt[16][3] = {QOAMAX_DQT_ROWS(QOAMAX_QT_ROW)};
+
+#define qoamax_assume(x) ((x) ? (void)0 : unreachable())
+
+#define QOAMAX_MIN(a, b) (((a) < (b)) ? (a) : (b))
+
+// Fully unrolls the 20-sample loops, unless the compiler optimizes for size (-Os, -Oz).
+#define QOAMAX_PRAGMA(x) _Pragma(#x)
+#ifdef __OPTIMIZE_SIZE__
+#define QOAMAX_UNROLL_SLICE
+#else
+#define QOAMAX_UNROLL_SLICE QOAMAX_PRAGMA(GCC unroll 20)
+#endif
+
+//! Saturates the value to the int16 range. Clipping is rare, so a branch keeps the clamp off the dependency chain.
 [[gnu::always_inline]]
-static inline int16_t qoamax_clamp_s16(int32_t value) {
-  return (((int16_t)value) == value) ? value : (value < 0 ? INT16_MIN : INT16_MAX);
-}
-
-//! Returns an error value that has the same sorting behavior as of @ref qoamax_error_squared, but is faster to compute.
-//! This is intended to be used when the error result is only used to find a local minima and then immediately
-//! discarded.
-[[gnu::always_inline]]
-static inline uint32_t qoamax_error_monotonic(int16_t actual, int16_t decoded) {
-  int32_t diff = ((int32_t)actual) - decoded;
-  uint32_t abs = diff < 0 ? -diff : +diff; //< On some platforms, squaring is faster than abs (e.g. Cortex-M0+)
-  return abs;
+static inline int32_t qoamax_clamp_s16(int32_t value) {
+  if (__builtin_expect((int16_t)value != value, 0)) value = value < 0 ? INT16_MIN : INT16_MAX;
+  return value;
 }
 
 //! Returns the squared error value, used to calculate or minimize the RMS error.
@@ -73,239 +79,255 @@ static inline uint32_t qoamax_error_squared(int16_t actual, int16_t decoded) {
   return error;
 }
 
-//! Returns the LMS filter's current prediction for the upcoming sample.
+//! Returns the squared error value, used to calculate or minimize the RMS error.
 [[gnu::always_inline]]
-static inline int32_t qoamax_lms_predict_next(const qoamax_lms *self) {
-  int32_t prediction = 0;
-
-  #pragma GCC unroll 4
-  for (int i = 0; i < 4; i++) {
-    prediction += self->weights[i] * self->history[i];
-  }
-
-  return prediction >> 13;
+static inline uint64_t qoamax_error_squared_unclamped(int16_t actual, int32_t decoded) {
+  int32_t diff = ((int32_t)actual) - decoded;
+  qoamax_assume(diff == ((int64_t)actual) - decoded);
+  uint64_t error = ((uint64_t)diff) * ((uint64_t)diff);
+  return error;
 }
 
-//! Updates the LMS filter's internal state, influencing the upcoming predictions.
+//! Returns a + b, saturating at UINT64_MAX.
 [[gnu::always_inline]]
-static inline void qoamax_lms_update(qoamax_lms *self, int16_t sample, int16_t residual) {
-  int16_t delta = residual >> 4;
+static inline uint64_t qoamax_add_saturating(uint64_t a, uint64_t b) {
+  uint64_t sum;
+  return __builtin_add_overflow(a, b, &sum) ? UINT64_MAX : sum;
+}
 
-  #pragma GCC unroll 4
-  for (int i = 0; i < 4; i++) {
-    self->weights[i] += self->history[i] < 0 ? -delta : delta;
+//! The LMS filter's state as local variables. The hot loops work on this copy instead of a qoamax_lms, which keeps
+//! the state in registers (clang keeps *lms or small arrays in memory, roughly halving the throughput).
+typedef struct {
+  int32_t h0, h1, h2, h3; //!< History
+  int32_t w0, w1, w2, w3; //!< Weights
+} qoamax_lms_regs;
+
+[[gnu::always_inline]]
+static inline qoamax_lms_regs qoamax_lms_load(const qoamax_lms *lms) {
+  return (qoamax_lms_regs){
+      lms->history[0], lms->history[1], lms->history[2], lms->history[3],
+      lms->weights[0], lms->weights[1], lms->weights[2], lms->weights[3],
+  };
+}
+
+[[gnu::always_inline]]
+static inline void qoamax_lms_store(qoamax_lms *lms, const qoamax_lms_regs *r) {
+  lms->history[0] = r->h0, lms->history[1] = r->h1, lms->history[2] = r->h2, lms->history[3] = r->h3;
+  lms->weights[0] = r->w0, lms->weights[1] = r->w1, lms->weights[2] = r->w2, lms->weights[3] = r->w3;
+}
+
+//! Returns the LMS filter's prediction for the next sample.
+[[gnu::always_inline]]
+static inline int32_t qoamax_lms_predict(const qoamax_lms_regs *r) {
+  // Unsigned to keep overflow defined: the weights can grow large (in the encoder's search or in crafted files).
+  uint32_t sum = (uint32_t)r->w0 * (uint32_t)r->h0 + (uint32_t)r->w1 * (uint32_t)r->h1 +
+                 (uint32_t)r->w2 * (uint32_t)r->h2 + (uint32_t)r->w3 * (uint32_t)r->h3;
+  return (int32_t)sum >> 13;
+}
+
+//! Updates the LMS filter with the next reconstructed sample and the table entry of its residual.
+[[gnu::always_inline]]
+static inline void qoamax_lms_update(qoamax_lms_regs *r, const qoamax_decoder_entry *entry, int32_t sample) {
+  r->w0 += entry->weight_delta[1 + (r->h0 >> 31)];
+  r->w1 += entry->weight_delta[1 + (r->h1 >> 31)];
+  r->w2 += entry->weight_delta[1 + (r->h2 >> 31)];
+  r->w3 += entry->weight_delta[1 + (r->h3 >> 31)];
+  r->h0 = r->h1, r->h1 = r->h2, r->h2 = r->h3, r->h3 = sample;
+}
+
+//! Returns the table entry of the slice's i-th residual (&row[(slice >> (57 - 3 * i)) & 7]), shifting the residual
+//! directly into a byte offset. Must be called for i = 0, 1, 2, ... in order, as it may consume the slice.
+[[gnu::always_inline]]
+static inline const qoamax_decoder_entry *qoamax_decoder_entry_at(const qoamax_decoder_entry row[static 8],
+                                                                  uint64_t *slice, int i) {
+  static_assert(sizeof(qoamax_decoder_entry) == 16);
+#ifdef __OPTIMIZE_SIZE__
+  // The loop is not unrolled, so constant shifts are cheaper than variable ones (especially on 32-bit targets).
+  (void)i;
+  uint64_t offset = (*slice >> (57 - 4)) & (7 << 4);
+  *slice <<= 3;
+#else
+  int shift       = 57 - 3 * i - 4;
+  uint64_t offset = (shift >= 0 ? *slice >> shift : *slice << -shift) & (7 << 4);
+#endif
+  return (const qoamax_decoder_entry *)((const char *)row + offset);
+}
+
+//! Decodes a slice like @ref qoamax_decode_slice, writing the i-th sample to out[i * stride].
+[[gnu::always_inline]]
+static inline void qoamax_decode_slice__impl(qoamax_lms *restrict lms, uint64_t slice, int16_t *restrict out,
+                                             int stride) {
+  const qoamax_decoder_entry *row = qoamax_decoder_table[slice >> 60];
+  qoamax_lms_regs regs            = qoamax_lms_load(lms);
+
+  QOAMAX_UNROLL_SLICE
+  for (int i = 0; i < 20; i++) {
+    const qoamax_decoder_entry *entry = qoamax_decoder_entry_at(row, &slice, i);
+    int32_t sample                    = qoamax_clamp_s16(qoamax_lms_predict(&regs) + entry->dequantized);
+    qoamax_lms_update(&regs, entry, sample);
+    out[i * stride] = sample;
   }
 
-  #pragma GCC unroll 3
-  for (int i = 0; i < 3; i++) {
-    self->history[i] = self->history[i + 1];
-  }
-
-  self->history[3] = sample;
+  qoamax_lms_store(lms, &regs);
 }
 
 void qoamax_decode_slice(qoamax_lms *restrict lms, uint64_t slice, int16_t out[static restrict 20]) {
-  int scalefactor = slice >> 60;
-  qoamax_assume(scalefactor >= 0 && scalefactor <= 15);
-  const int16_t *restrict dqt = qoamax_dqt[scalefactor];
-  slice <<= 4;
-
-  #pragma GCC unroll 20
-  for (int i = 0; i < 20; i++) {
-    int residual = slice >> 61;
-    qoamax_assume(residual >= 0 && residual <= 7);
-    slice <<= 3;
-
-    int16_t dequantized   = dqt[residual];
-    int32_t predicted     = qoamax_lms_predict_next(lms);
-    int16_t reconstructed = qoamax_clamp_s16(predicted + dequantized);
-    qoamax_lms_update(lms, reconstructed, dequantized);
-    out[i] = reconstructed;
-  }
+  qoamax_decode_slice__impl(lms, slice, out, 1);
 }
+
+//! Decodes a slice directly into an interleaved buffer (out[i * stride]), see @ref qoamax_decode_slice.
+static void qoamax_decode_slice__interleaved(qoamax_lms *restrict lms, uint64_t slice, int16_t *restrict out,
+                                             int stride) {
+  qoamax_decode_slice__impl(lms, slice, out, stride);
+}
+
+//! The rank-th value of the search order center, center - 1, center + 1, center - 2, center + 2, ...
+//! The encoder searches scalefactors outward from the previous slice's one, as it usually is close to the best one.
+static inline int qoamax_outward(int center, int rank) { return center + ((rank >> 1) ^ -(rank & 1)); }
+
+///////////////////////////////////////////////////////////////////////////////
+//                        Hillclimb Encoding Algorithm                       //
+///////////////////////////////////////////////////////////////////////////////
 
 //! Performs a hill-climb search (equivalent to beam search with width=1).
 //!
-//! The hill-climb search encodes the audio samples by choosing the
-//! most promising residual at each point, never reconsidering past choices.
+//! The hill-climb search encodes the audio samples with the given scalefactor by choosing the
+//! closest codepoint at each point, never reconsidering past choices.
 //!
-//! The resulting quality is lower than of the reference encoder.
-//! This function is primarily used for calculating a quick error estimate,
-//! allowing the beam search to ignore most bad options, increasing performance.
+//! The normal variant measures the error of the decoded samples; it is the encoder of the hill-climb efforts.
+//! The unclamped variant measures the error before clamping the reconstructed samples to int16 (like the beam
+//! search), and provides the error bound that lets the beam search skip most bad options.
 //!
-//! @returns the cumulative squared error
-static uint64_t qoamax_encode_hillclimb_search(qoamax_lms lms[static restrict 1], int samples_count,
-                                               const int16_t samples[static restrict 20], int scalefactor,
-                                               uint64_t error_hint, uint64_t slice_out[static restrict 1]) {
+//! @returns the cumulative squared error, or -1 as soon as it reaches error_hint (lms is left unchanged then).
+[[gnu::always_inline]]
+static inline uint64_t qoamax_encode_hillclimb_search_impl(qoamax_lms lms[static restrict 1], int samples_count,
+                                                           const int16_t samples[static restrict samples_count],
+                                                           int scalefactor, uint64_t error_hint,
+                                                           uint64_t slice_out[static restrict 1], bool unclamped) {
   qoamax_assume(samples_count >= 1 && samples_count <= 20);
   qoamax_assume(scalefactor >= 0 && scalefactor <= 15);
 
-  const int16_t *dqt = qoamax_dqt[scalefactor];
-  const int16_t *qt  = qoamax_qt[scalefactor];
+  const qoamax_decoder_entry *row = qoamax_decoder_table[scalefactor];
+  const int16_t *qt               = qoamax_qt[scalefactor];
+  qoamax_lms_regs regs            = qoamax_lms_load(lms);
 
   uint64_t slice = scalefactor;
   uint64_t error = 0;
 
-  #pragma GCC unroll 20
+  QOAMAX_UNROLL_SLICE
   for (int i = 0; i < samples_count; i++) {
-    int32_t predicted    = qoamax_lms_predict_next(lms);
-    int16_t sample       = samples[i];
-    int32_t residual     = ((int32_t)sample) - predicted;
+    int32_t predicted    = qoamax_lms_predict(&regs);
+    int32_t sample       = samples[i];
+    int32_t residual     = sample - predicted;
     int32_t residual_abs = residual < 0 ? -residual : residual;
 
+    // This line computes the best codepoint unless the signal is clipping.
+    // However, even if the signal is clipping, choosing the non-optimal codepoint may be beneficial.
     int quant = (((residual_abs > qt[0]) + (residual_abs > qt[1]) + (residual_abs > qt[2])) << 1) + (residual <= 0);
+    slice     = (slice << 3) | quant;
 
-    // Decode best sample again to update lms
-    qoamax_assume(quant >= 0 && quant <= 7);
-    slice = (slice << 3) | quant;
-
-    int16_t dequantized   = dqt[quant];
-    int16_t reconstructed = qoamax_clamp_s16(predicted + dequantized);
-    uint32_t code_error   = qoamax_error_squared(sample, reconstructed);
-    error += code_error;
+    const qoamax_decoder_entry *entry = &row[quant];
+    int32_t reconstructed             = predicted + entry->dequantized;
+    int32_t clamped                   = qoamax_clamp_s16(reconstructed);
+    if (unclamped)
+      error = qoamax_add_saturating(error, qoamax_error_squared_unclamped(sample, reconstructed));
+    else
+      error += qoamax_error_squared(sample, clamped);
     if (error >= error_hint) return -1;
 
-    qoamax_lms_update(lms, reconstructed, dequantized);
+    qoamax_lms_update(&regs, entry, clamped);
   }
 
   slice <<= (20 - samples_count) * 3;
   *slice_out = slice;
+  qoamax_lms_store(lms, &regs);
   return error;
 }
 
-//! Performs or continues a beam search, adding a full 64-bit qoa slice to the encoder nodes
-//!(lookahead of <=20 samples).
-static int qoamax_encode_beam_search(qoamax_encoder_node *restrict nodes[static restrict 2], int initial_nodes_size,
-                                     int width, int slice_pos, int samples_size,
-                                     const int16_t samples[static restrict 20], int scalefactor, uint64_t error_hint) {
-  constexpr int W = 1024;
-  qoamax_assume(samples_size >= 1 && samples_size <= 20);
-  qoamax_assume(width > 0 && width <= W);
-
-  uint16_t heap[W]; // Reference-heap with indexes into nodes_src[]
-
-  qoamax_encoder_node *nodes_src = nodes[0], *nodes_dst = nodes[1];
-  int nodes_src_size = initial_nodes_size;
-
-  for (int i = 0; i < nodes_src_size; i++) {
-    nodes_src[i].slices[slice_pos] = scalefactor;
-  }
-
-  for (int i = 0; i < samples_size; i++) {
-    int16_t actual_sample = samples[i];
-
-    int nodes_dst_unused = width;
-    uint64_t max_error   = error_hint;
-
-    for (int j = 0; j < nodes_src_size; j++) {
-      uint64_t current_error      = nodes_src[j].error;
-      int32_t predicted           = qoamax_lms_predict_next(&nodes_src[j].lms);
-      const int16_t *restrict dqt = qoamax_dqt[scalefactor];
-
-      for (int codepoint = 0; codepoint < 8; codepoint++) {
-        int16_t dequantized   = dqt[codepoint];
-        int16_t reconstructed = qoamax_clamp_s16(predicted + dequantized);
-        uint32_t error        = qoamax_error_squared(actual_sample, reconstructed);
-        uint64_t new_error    = current_error + error;
-
-        if (new_error >= max_error) continue;
-
-        int target;
-        if (nodes_dst_unused > 0) {
-          target = width - nodes_dst_unused;
-          nodes_dst_unused -= 1;
-          nodes_dst[target].error = new_error;
-
-          // Insert into max heap (still has unused capacity)
-          int heap_pos   = target;
-          heap[heap_pos] = target;
-          while (heap_pos > 0) {
-            int parent_pos = (heap_pos - 1) >> 1;
-            if (nodes_dst[heap[parent_pos]].error >= nodes_dst[heap[heap_pos]].error) break;
-
-            auto tmp         = heap[parent_pos];
-            heap[parent_pos] = heap[heap_pos];
-            heap[heap_pos]   = tmp;
-            heap_pos         = parent_pos;
-          }
-        } else if (nodes_dst_unused == 0) {
-          target                  = heap[0];
-          nodes_dst[target].error = new_error;
-
-          // Replace the max element inside the heap
-          int heap_pos = 0;
-          while (true) {
-            int left = 2 * heap_pos + 1, right = 2 * heap_pos + 2;
-            int largest = heap_pos;
-            if (left < width && nodes_dst[heap[left]].error > nodes_dst[heap[largest]].error) largest = left;
-            if (right < width && nodes_dst[heap[right]].error > nodes_dst[heap[largest]].error) largest = right;
-            if (largest == heap_pos) break;
-
-            auto tmp       = heap[largest];
-            heap[largest]  = heap[heap_pos];
-            heap[heap_pos] = tmp;
-            heap_pos       = largest;
-          }
-        } else {
-          unreachable();
-        }
-        if (nodes_dst_unused == 0) {
-          max_error = MIN(max_error, nodes_dst[heap[0]].error);
-        }
-
-        for (int k = 0; k < 3; k++) {
-          nodes_dst[target].slices[k] = nodes_src[j].slices[k];
-        }
-        nodes_dst[target].slices[slice_pos] = (nodes_src[j].slices[slice_pos] << 3) | codepoint;
-        nodes_dst[target].lms               = nodes_src[j].lms;
-        qoamax_lms_update(&nodes_dst[target].lms, reconstructed, dequantized);
-      }
-    }
-
-    auto tmp       = nodes_dst;
-    nodes_dst      = nodes_src;
-    nodes_src      = tmp;
-    nodes_src_size = width - nodes_dst_unused;
-  }
-
-  nodes[0] = nodes_src;
-  nodes[1] = nodes_dst;
-  return nodes_src_size;
+//! See @ref qoamax_encode_hillclimb_search_impl. The common 20-sample case gets its own copy, which the compiler can
+//! fully unroll without a loop exit check after every sample.
+static uint64_t qoamax_encode_hillclimb_search(qoamax_lms lms[static restrict 1], int samples_count,
+                                               const int16_t samples[static restrict samples_count], int scalefactor,
+                                               uint64_t error_hint, uint64_t slice_out[static restrict 1]) {
+  if (samples_count == 20)
+    return qoamax_encode_hillclimb_search_impl(lms, 20, samples, scalefactor, error_hint, slice_out, false);
+  return qoamax_encode_hillclimb_search_impl(lms, samples_count, samples, scalefactor, error_hint, slice_out, false);
 }
 
-static inline uint64_t
-qoamax_encode_slice__hillclimb_scalefactor_search(qoamax_lms *lms, int first_scalefactor, int lookahead,
-                                                  const int16_t samples[static restrict lookahead], uint64_t error_hint,
-                                                  uint64_t *out_slice, uint64_t *out_error) {
-  uint64_t best_slice;
-  uint64_t best_error;
-  qoamax_lms best_lms;
+//! See @ref qoamax_encode_hillclimb_search_impl. The common 20-sample case gets its own copy.
+static uint64_t qoamax_encode_hillclimb_search_unclamped(qoamax_lms lms[static restrict 1], int samples_count,
+                                                         const int16_t samples[static restrict samples_count],
+                                                         int scalefactor, uint64_t error_hint,
+                                                         uint64_t slice_out[static restrict 1]) {
+  if (samples_count == 20)
+    return qoamax_encode_hillclimb_search_impl(lms, 20, samples, scalefactor, error_hint, slice_out, true);
+  return qoamax_encode_hillclimb_search_impl(lms, samples_count, samples, scalefactor, error_hint, slice_out, true);
+}
 
-  for (int scalefactor = 0; scalefactor < 31; scalefactor += 1) {
-    int chosen_scalefactor = first_scalefactor + ((scalefactor >> 1) ^ -(scalefactor & 1));
-    if ((unsigned)chosen_scalefactor >= 16) continue;
+///////////////////////////////////////////////////////////////////////////////
+//                      Hillclimb Scalefactor Search                         //
+///////////////////////////////////////////////////////////////////////////////
 
-    uint64_t local_slice;
+//! Searches the scalefactor with the lowest hill-climb error over the lookahead (recursively choosing the best
+//! scalefactors of the following slices), considering only results better than error_hint.
+//! Ties are resolved in favor of the scalefactor closest to first_scalefactor.
+//!
+//! @returns the error over the whole lookahead, or error_hint if no result is better. The first slice, its error and
+//!          the LMS state after it are stored in out_slice, out_error and lms.
+//!
+//! Comes in a normal and an unclamped variant like @ref qoamax_encode_hillclimb_search_impl. Both are thin wrappers
+//! around one always_inline implementation, so the variant is known at compile time.
+static uint64_t
+qoamax_encode_slice__hillclimb_scalefactor_search_scalar(qoamax_lms *lms, int first_scalefactor, int lookahead,
+                                                         const int16_t samples[static restrict lookahead],
+                                                         uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error);
+static uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_scalar_unclamped(
+    qoamax_lms *lms, int first_scalefactor, int lookahead, const int16_t samples[static restrict lookahead],
+    uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error);
+
+[[gnu::always_inline]]
+static inline uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_scalar_impl(
+    qoamax_lms *lms, int first_scalefactor, int lookahead, const int16_t samples[static restrict lookahead],
+    uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error, bool unclamped) {
+  int samples_count   = QOAMAX_MIN(20, lookahead);
+  uint64_t best_slice = 0;
+  uint64_t best_error = 0;
+  qoamax_lms best_lms = *lms;
+
+  for (int rank = 0; rank < 31; rank++) {
+    int scalefactor = qoamax_outward(first_scalefactor, rank);
+    if ((unsigned)scalefactor >= 16) continue;
+
     qoamax_lms local_lms = *lms;
-    uint64_t local_error = qoamax_encode_hillclimb_search(&local_lms, MIN(20, lookahead), samples, chosen_scalefactor,
-                                                          error_hint, &local_slice);
+    uint64_t local_slice;
+    uint64_t local_error;
+    if (unclamped)
+      local_error = qoamax_encode_hillclimb_search_unclamped(&local_lms, samples_count, samples, scalefactor,
+                                                             error_hint, &local_slice);
+    else
+      local_error =
+          qoamax_encode_hillclimb_search(&local_lms, samples_count, samples, scalefactor, error_hint, &local_slice);
     if (local_error >= error_hint) continue;
 
     uint64_t total_error = local_error;
-
     if (lookahead > 20) {
-      qoamax_lms recursive_lms = local_lms;
-      uint64_t tmp_slice;
-      uint64_t tmp_error;
-      total_error += qoamax_encode_slice__hillclimb_scalefactor_search(
-          &recursive_lms, chosen_scalefactor, lookahead - 20, &samples[20], error_hint - local_error, &tmp_slice,
-          &tmp_error);
+      // Only the error of the following slices matters here, their slices and LMS states are discarded.
+      qoamax_lms next_lms = local_lms;
+      uint64_t next_slice, next_first_error;
+      if (unclamped)
+        total_error += qoamax_encode_slice__hillclimb_scalefactor_search_scalar_unclamped(
+            &next_lms, scalefactor, lookahead - 20, &samples[20], error_hint - local_error, &next_slice,
+            &next_first_error);
+      else
+        total_error += qoamax_encode_slice__hillclimb_scalefactor_search_scalar(&next_lms, scalefactor, lookahead - 20,
+                                                                                &samples[20], error_hint - local_error,
+                                                                                &next_slice, &next_first_error);
     }
 
     if (total_error < error_hint) {
       error_hint = total_error;
-      best_error = local_error;
       best_slice = local_slice;
+      best_error = local_error;
       best_lms   = local_lms;
     }
   }
@@ -316,213 +338,727 @@ qoamax_encode_slice__hillclimb_scalefactor_search(qoamax_lms *lms, int first_sca
   return error_hint;
 }
 
-static inline void qoamax_encode_slice__beam_scalefactor_search(qoamax_encoder_node **nodes, int32_t *nodes_sizes,
-                                                                int beam_width, int depth, int first_scalefactor,
-                                                                int lookahead,
-                                                                const int16_t samples[static restrict lookahead],
-                                                                uint64_t error_hint, qoamax_encoder_node *out_node) {
-  for (int scalefactor = 0; scalefactor < 31; scalefactor += 1) {
-    int chosen_scalefactor = first_scalefactor + ((scalefactor >> 1) ^ -(scalefactor & 1));
-    if ((unsigned)chosen_scalefactor >= 16) continue;
+//! See @ref qoamax_encode_slice__hillclimb_scalefactor_search_scalar_impl.
+static uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_scalar(
+    qoamax_lms *lms, int first_scalefactor, int lookahead, const int16_t samples[static restrict lookahead],
+    uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error) {
+  return qoamax_encode_slice__hillclimb_scalefactor_search_scalar_impl(lms, first_scalefactor, lookahead, samples,
+                                                                       error_hint, out_slice, out_error, false);
+}
 
-    // Copy initial state (previous recursion)
-    memcpy(nodes[depth], nodes[depth - 1], sizeof(qoamax_encoder_node) * nodes_sizes[depth - 1]);
-    nodes_sizes[depth] = nodes_sizes[depth - 1];
+//! See @ref qoamax_encode_slice__hillclimb_scalefactor_search_scalar_impl.
+static uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_scalar_unclamped(
+    qoamax_lms *lms, int first_scalefactor, int lookahead, const int16_t samples[static restrict lookahead],
+    uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error) {
+  return qoamax_encode_slice__hillclimb_scalefactor_search_scalar_impl(lms, first_scalefactor, lookahead, samples,
+                                                                       error_hint, out_slice, out_error, true);
+}
 
-    // TODO: Narrow error hint down
+// The SIMD search runs the hill-climb for several scalefactors at once, one lane per scalefactor (at most 16), using
+// the vector width known at compile time. Targets without (known) SIMD support use the scalar search instead.
+#ifndef QOAMAX_LANES
+#if defined(__AVX512F__)
+#define QOAMAX_LANES 16
+#elif defined(__AVX2__)
+#define QOAMAX_LANES 8
+#elif defined(__ARM_FEATURE_SVE_BITS) && __ARM_FEATURE_SVE_BITS >= 128 // -msve-vector-bits=...
+#define QOAMAX_LANES (__ARM_FEATURE_SVE_BITS >= 512 ? 16 : __ARM_FEATURE_SVE_BITS / 32)
+#elif defined(__riscv_v_fixed_vlen) // -mrvv-vector-bits=zvl
+#define QOAMAX_LANES (__riscv_v_fixed_vlen >= 512 ? 16 : __riscv_v_fixed_vlen / 32)
+#elif defined(__riscv_v_min_vlen) && __riscv_v_min_vlen >= 64
+#define QOAMAX_LANES (__riscv_v_min_vlen >= 512 ? 16 : __riscv_v_min_vlen / 32)
+#elif defined(__SSE2__) || defined(__ARM_NEON) || defined(__ARM_FEATURE_MVE)
+#define QOAMAX_LANES 4
+#else
+#define QOAMAX_LANES 1
+#endif
+#endif
+static_assert(QOAMAX_LANES >= 1 && QOAMAX_LANES <= 16 && 16 % QOAMAX_LANES == 0);
+#define QOAMAX_GROUPS (16 / QOAMAX_LANES)
+
+#if QOAMAX_LANES > 1
+
+//! qoamax_dqt (positive values) and qoamax_qt transposed, so that a vector can hold one scalefactor per lane.
+#define QOAMAX_COLUMN_A(a, b, c, d) a,
+#define QOAMAX_COLUMN_B(a, b, c, d) b,
+#define QOAMAX_COLUMN_C(a, b, c, d) c,
+#define QOAMAX_COLUMN_D(a, b, c, d) d,
+#define QOAMAX_COLUMN_AB(a, b, c, d) ((a) + (b)) / 2,
+#define QOAMAX_COLUMN_BC(a, b, c, d) ((b) + (c)) / 2,
+#define QOAMAX_COLUMN_CD(a, b, c, d) ((c) + (d)) / 2,
+static const int32_t qoamax_lanes_dqt[4][16] = {
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_A)},
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_B)},
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_C)},
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_D)},
+};
+static const int32_t qoamax_lanes_qt[3][16] = {
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_AB)},
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_BC)},
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_CD)},
+};
+
+//! Inverse of @ref qoamax_outward: the position of value in the search order around center.
+static inline int qoamax_outward_rank(int value, int center) {
+  int distance = value - center;
+  return distance < 0 ? -2 * distance - 1 : 2 * distance;
+}
+
+typedef int32_t qoamax_vi32 __attribute__((vector_size(QOAMAX_LANES * 4)));
+typedef uint32_t qoamax_vu32 __attribute__((vector_size(QOAMAX_LANES * 4)));
+
+//! Hill-climb results of all 16 scalefactors (indexed by scalefactor) after encoding the same samples.
+typedef struct {
+  int32_t history[4][16];
+  int32_t weights[4][16];
+  int32_t quant[20][16];
+  uint64_t errors[16];
+} qoamax_scalefactor_results;
+
+//! Runs @ref qoamax_encode_hillclimb_search (or its unclamped variant) for the QOAMAX_LANES scalefactors starting at
+//! `first`, one per lane. Stops early once every lane's error reaches `bound`; the lanes' errors are UINT64_MAX then
+//! and their other results are unspecified.
+[[gnu::always_inline]]
+static inline void qoamax_hillclimb_lanes_impl(const qoamax_lms *lms, int samples_count,
+                                               const int16_t samples[static restrict samples_count], int first,
+                                               uint64_t bound, qoamax_scalefactor_results *restrict out,
+                                               bool unclamped) {
+  qoamax_assume(samples_count >= 1 && samples_count <= 20);
+
+  qoamax_vi32 q0, q1, q2, d0, d1, d2, d3;
+  memcpy(&q0, &qoamax_lanes_qt[0][first], sizeof q0);
+  memcpy(&q1, &qoamax_lanes_qt[1][first], sizeof q1);
+  memcpy(&q2, &qoamax_lanes_qt[2][first], sizeof q2);
+  memcpy(&d0, &qoamax_lanes_dqt[0][first], sizeof d0);
+  memcpy(&d1, &qoamax_lanes_dqt[1][first], sizeof d1);
+  memcpy(&d2, &qoamax_lanes_dqt[2][first], sizeof d2);
+  memcpy(&d3, &qoamax_lanes_dqt[3][first], sizeof d3);
+
+  const qoamax_vi32 zero = {};
+  qoamax_vi32 h0 = zero + lms->history[0], h1 = zero + lms->history[1];
+  qoamax_vi32 h2 = zero + lms->history[2], h3 = zero + lms->history[3];
+  qoamax_vi32 w0 = zero + lms->weights[0], w1 = zero + lms->weights[1];
+  qoamax_vi32 w2 = zero + lms->weights[2], w3 = zero + lms->weights[3];
+  qoamax_vu32 error_low = {}, error_high = {}; // 64-bit errors, split into two halves
+
+  QOAMAX_UNROLL_SLICE
+  for (int i = 0; i < samples_count; i++) {
+    qoamax_vi32 sample = zero + samples[i];
+
+    // Unsigned to keep overflow defined; the result is the same as in the scalar code.
+    qoamax_vu32 sum       = (qoamax_vu32)w0 * (qoamax_vu32)h0 + (qoamax_vu32)w1 * (qoamax_vu32)h1 +
+                            (qoamax_vu32)w2 * (qoamax_vu32)h2 + (qoamax_vu32)w3 * (qoamax_vu32)h3;
+    qoamax_vi32 predicted = (qoamax_vi32)sum >> 13;
+    qoamax_vi32 residual  = sample - predicted;
+    qoamax_vi32 negative  = residual <= 0;
+    qoamax_vi32 abs       = (residual ^ (residual >> 31)) - (residual >> 31);
+    qoamax_vi32 above0 = abs > q0, above1 = abs > q1, above2 = abs > q2; // nested: above2 implies above1 implies above0
+
+    qoamax_vi32 magnitude   = d0 + (above0 & (d1 - d0)) + (above1 & (d2 - d1)) + (above2 & (d3 - d2));
+    qoamax_vi32 dequantized = (magnitude ^ negative) - negative;
+    qoamax_vi32 quant       = (-(above0 + above1 + above2) << 1) | (negative & 1);
+    memcpy(&out->quant[i][first], &quant, sizeof quant);
+
+    qoamax_vi32 reconstructed  = predicted + dequantized;
+    qoamax_vi32 unclamped_diff = sample - reconstructed;
+    qoamax_vi32 too_low        = reconstructed < INT16_MIN;
+    reconstructed              = (reconstructed & ~too_low) | (INT16_MIN & too_low);
+    qoamax_vi32 too_high       = reconstructed > INT16_MAX;
+    reconstructed              = (reconstructed & ~too_high) | (INT16_MAX & too_high);
+
+    if (unclamped) {
+      // The difference before clamping can exceed 16 bits (|diff| < 2^19), so its square is computed from 16-bit
+      // halves: diff^2 = high^2 * 2^32 + 2 * high * low * 2^16 + low^2.
+      qoamax_vu32 diff = (qoamax_vu32)((unclamped_diff ^ (unclamped_diff >> 31)) - (unclamped_diff >> 31));
+      qoamax_vu32 low = diff & 0xFFFF, high = diff >> 16;
+      qoamax_vu32 cross     = 2 * high * low; // < 2^20
+      qoamax_vu32 new_error = error_low + low * low;
+      error_high -= (qoamax_vu32)(new_error < error_low);
+      error_low = new_error;
+      new_error = error_low + (cross << 16);
+      error_high -= (qoamax_vu32)(new_error < error_low);
+      error_low = new_error;
+      error_high += (cross >> 16) + high * high;
+    } else {
+      qoamax_vi32 diff      = sample - reconstructed;
+      qoamax_vu32 new_error = error_low + (qoamax_vu32)diff * (qoamax_vu32)diff;
+      error_high -= (qoamax_vu32)(new_error < error_low); // carry (the comparison yields -1)
+      error_low = new_error;
+    }
+
+    qoamax_vi32 delta = dequantized >> 4;
+    qoamax_vi32 sign0 = h0 >> 31, sign1 = h1 >> 31, sign2 = h2 >> 31, sign3 = h3 >> 31;
+    w0 += (delta ^ sign0) - sign0;
+    w1 += (delta ^ sign1) - sign1;
+    w2 += (delta ^ sign2) - sign2;
+    w3 += (delta ^ sign3) - sign3;
+    h0 = h1, h1 = h2, h2 = h3, h3 = reconstructed;
+
+    if (i % 2 == 1 && i + 1 < samples_count) {
+      uint32_t bound_high = bound >> 32, bound_low = bound;
+      qoamax_vi32 alive = (error_high < bound_high) | ((error_high == bound_high) & (error_low < bound_low));
+      bool any_alive    = false;
+      for (int lane = 0; lane < QOAMAX_LANES; lane++) any_alive |= alive[lane] != 0;
+      if (!any_alive) {
+        for (int lane = 0; lane < QOAMAX_LANES; lane++) out->errors[first + lane] = UINT64_MAX;
+        return;
+      }
+    }
+  }
+
+  for (int lane = 0; lane < QOAMAX_LANES; lane++)
+    out->errors[first + lane] = (uint64_t)error_high[lane] << 32 | error_low[lane];
+  memcpy(&out->history[0][first], &h0, sizeof h0);
+  memcpy(&out->history[1][first], &h1, sizeof h1);
+  memcpy(&out->history[2][first], &h2, sizeof h2);
+  memcpy(&out->history[3][first], &h3, sizeof h3);
+  memcpy(&out->weights[0][first], &w0, sizeof w0);
+  memcpy(&out->weights[1][first], &w1, sizeof w1);
+  memcpy(&out->weights[2][first], &w2, sizeof w2);
+  memcpy(&out->weights[3][first], &w3, sizeof w3);
+}
+
+//! See @ref qoamax_hillclimb_lanes_impl. The common 20-sample case gets its own fully unrolled copy.
+static void qoamax_hillclimb_lanes(const qoamax_lms *lms, int samples_count,
+                                   const int16_t samples[static restrict samples_count], int first, uint64_t bound,
+                                   qoamax_scalefactor_results *restrict out) {
+  if (samples_count == 20) return qoamax_hillclimb_lanes_impl(lms, 20, samples, first, bound, out, false);
+  return qoamax_hillclimb_lanes_impl(lms, samples_count, samples, first, bound, out, false);
+}
+
+//! See @ref qoamax_hillclimb_lanes_impl (unclamped variant).
+static void qoamax_hillclimb_lanes_unclamped(const qoamax_lms *lms, int samples_count,
+                                             const int16_t samples[static restrict samples_count], int first,
+                                             uint64_t bound, qoamax_scalefactor_results *restrict out) {
+  if (samples_count == 20) return qoamax_hillclimb_lanes_impl(lms, 20, samples, first, bound, out, true);
+  return qoamax_hillclimb_lanes_impl(lms, samples_count, samples, first, bound, out, true);
+}
+
+static uint64_t
+qoamax_encode_slice__hillclimb_scalefactor_search_lanes(qoamax_lms *lms, int first_scalefactor, int lookahead,
+                                                        const int16_t samples[static restrict lookahead],
+                                                        uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error);
+static uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped(
+    qoamax_lms *lms, int first_scalefactor, int lookahead, const int16_t samples[static restrict lookahead],
+    uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error);
+
+//! SIMD version of @ref qoamax_encode_slice__hillclimb_scalefactor_search_scalar_impl with identical results.
+[[gnu::always_inline]]
+static inline uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_lanes_impl(
+    qoamax_lms *lms, int first_scalefactor, int lookahead, const int16_t samples[static restrict lookahead],
+    uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error, bool unclamped) {
+  int samples_count = QOAMAX_MIN(20, lookahead);
+  qoamax_scalefactor_results results;
+
+  int rank[16];
+  for (int sf = 0; sf < 16; sf++) rank[sf] = qoamax_outward_rank(sf, first_scalefactor);
+
+  int best            = -1;
+  uint64_t best_error = error_hint;
+  int first_group     = first_scalefactor / QOAMAX_LANES;
+
+  // Visit the lane groups outwards from the previous scalefactor.
+  // Once a candidate is found, its error bounds the remaining groups.
+  for (int i = 0, visited = 0; visited < QOAMAX_GROUPS; i++) {
+    int group = qoamax_outward(first_group, i);
+    if ((unsigned)group >= QOAMAX_GROUPS) continue;
+    visited++;
+
+    int first = group * QOAMAX_LANES;
+
+    // Lanes can only win with a lower error, or with an equal error and a better rank than the current best.
+    bool may_win_tie = false;
+    for (int sf = first; sf < first + QOAMAX_LANES; sf++) may_win_tie |= best >= 0 && rank[sf] < rank[best];
+    uint64_t bound = best < 0 ? error_hint : best_error + may_win_tie;
+    if (unclamped)
+      qoamax_hillclimb_lanes_unclamped(lms, samples_count, samples, first, bound, &results);
+    else
+      qoamax_hillclimb_lanes(lms, samples_count, samples, first, bound, &results);
+
+    // Visit the group's candidates by increasing error of their first slice (ties by rank), so the loop can stop
+    // as soon as that error alone is too large.
+    int order[QOAMAX_LANES];
+    for (int j = 0; j < QOAMAX_LANES; j++) {
+      int sf = first + j, k = j;
+      for (; k > 0; k--) {
+        int other = order[k - 1];
+        if (results.errors[other] < results.errors[sf]) break;
+        if (results.errors[other] == results.errors[sf] && rank[other] < rank[sf]) break;
+        order[k] = other;
+      }
+      order[k] = sf;
+    }
+
+    for (int j = 0; j < QOAMAX_LANES; j++) {
+      int sf         = order[j];
+      uint64_t error = results.errors[sf];
+      bool wins_tie  = best >= 0 && rank[sf] < rank[best];
+      if (error > best_error) break;
+      if (error == best_error && !wins_tie) continue;
+
+      if (lookahead > 20) {
+        qoamax_lms next_lms;
+        for (int k = 0; k < 4; k++)
+          next_lms.history[k] = results.history[k][sf], next_lms.weights[k] = results.weights[k][sf];
+
+        uint64_t next_hint = best_error - error + wins_tie, next_slice, next_first_error;
+        uint64_t next_error =
+            unclamped ? qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped(
+                            &next_lms, sf, lookahead - 20, &samples[20], next_hint, &next_slice, &next_first_error)
+                      : qoamax_encode_slice__hillclimb_scalefactor_search_lanes(
+                            &next_lms, sf, lookahead - 20, &samples[20], next_hint, &next_slice, &next_first_error);
+        if (next_error >= next_hint) continue;
+        error += next_error;
+      }
+
+      if (error < best_error || (error == best_error && wins_tie)) best = sf, best_error = error;
+    }
+  }
+
+  if (best < 0) return error_hint;
+
+  uint64_t slice = best;
+  for (int i = 0; i < samples_count; i++) slice = (slice << 3) | results.quant[i][best];
+  *out_slice = slice << ((20 - samples_count) * 3);
+  *out_error = results.errors[best];
+  for (int k = 0; k < 4; k++) lms->history[k] = results.history[k][best], lms->weights[k] = results.weights[k][best];
+  return best_error;
+}
+
+//! See @ref qoamax_encode_slice__hillclimb_scalefactor_search_lanes_impl.
+static uint64_t
+qoamax_encode_slice__hillclimb_scalefactor_search_lanes(qoamax_lms *lms, int first_scalefactor, int lookahead,
+                                                        const int16_t samples[static restrict lookahead],
+                                                        uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error) {
+  return qoamax_encode_slice__hillclimb_scalefactor_search_lanes_impl(lms, first_scalefactor, lookahead, samples,
+                                                                      error_hint, out_slice, out_error, false);
+}
+
+//! See @ref qoamax_encode_slice__hillclimb_scalefactor_search_lanes_impl.
+static uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped(
+    qoamax_lms *lms, int first_scalefactor, int lookahead, const int16_t samples[static restrict lookahead],
+    uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error) {
+  return qoamax_encode_slice__hillclimb_scalefactor_search_lanes_impl(lms, first_scalefactor, lookahead, samples,
+                                                                      error_hint, out_slice, out_error, true);
+}
+
+#endif
+
+///////////////////////////////////////////////////////////////////////////////
+//                           Beam Encoding Algorithm                         //
+///////////////////////////////////////////////////////////////////////////////
+
+//! A node of the beam search: one candidate encoding of the samples so far.
+typedef struct {
+  uint64_t error; //!< Cumulative (unclamped) squared error
+  uint64_t slice; //!< The first slice of this node's path; only this slice is used as the result
+  qoamax_lms lms;
+} qoamax_beam_node;
+
+typedef struct {
+  uint64_t error;
+  uint32_t slot;
+} qoamax_beam_heap_entry;
+
+//! The candidates of one beam search step, stored by slot: arrays with an entry per slot (at least the beam width).
+//! They point to local arrays of the caller; once inlined, the compiler addresses those directly.
+typedef struct {
+  qoamax_beam_heap_entry *heap; //!< Max-heap of the used slots, ordered by error
+  uint64_t *error;
+  uint16_t *parent; //!< Index of the source node
+  uint8_t *codepoint;
+} qoamax_beam_slots;
+
+//! Adds a candidate to the beam, replacing the worst one if all `width` slots are already used.
+[[gnu::always_inline]]
+static inline void qoamax_beam_insert(qoamax_beam_slots slots, int *used, int width, uint64_t error, int parent,
+                                      int codepoint) {
+  qoamax_beam_heap_entry *heap = slots.heap;
+  int slot, heap_pos;
+  if (*used < width) {
+    slot = heap_pos = (*used)++;
+    while (heap_pos > 0) {
+      int parent_pos = (heap_pos - 1) >> 1;
+      if (heap[parent_pos].error >= error) break;
+      heap[heap_pos] = heap[parent_pos];
+      heap_pos       = parent_pos;
+    }
+  } else {
+    slot = heap[0].slot, heap_pos = 0;
+    while (true) {
+      int left = 2 * heap_pos + 1, right = 2 * heap_pos + 2;
+      int largest            = heap_pos;
+      uint64_t largest_error = error;
+      if (left < width && heap[left].error > largest_error) largest = left, largest_error = heap[left].error;
+      if (right < width && heap[right].error > largest_error) largest = right, largest_error = heap[right].error;
+      if (largest == heap_pos) break;
+      heap[heap_pos] = heap[largest];
+      heap_pos       = largest;
+    }
+  }
+  heap[heap_pos].error = error, heap[heap_pos].slot = slot;
+
+  slots.error[slot]     = error;
+  slots.parent[slot]    = parent;
+  slots.codepoint[slot] = codepoint;
+}
+
+//! Runs a beam search with the given scalefactor over the samples, starting from the `src` nodes (not modified).
+//! The error is computed before clamping the reconstructed sample to 16 bits.
+//!
+//! Every step keeps the `width` best candidates (8 codepoints per node). Candidates are first collected in a max-heap
+//! of slots, and the surviving nodes are only constructed once the step is complete.
+//!
+//! @param buffers   Room for 2 * width nodes, alternately used by the steps.
+//! @param slots     Room for `width` candidates.
+//! @param predicted Room for `width` predictions.
+//! @returns the number of resulting nodes, which are stored in buffers (*out).
+[[gnu::always_inline]]
+static inline int qoamax_encode_beam_search_impl(const qoamax_beam_node *restrict src, int src_count,
+                                                 qoamax_beam_node *restrict buffers, int width, bool first_slice,
+                                                 int samples_size, const int16_t samples[static restrict samples_size],
+                                                 int scalefactor, uint64_t error_hint,
+                                                 qoamax_beam_node *restrict *restrict out, qoamax_beam_slots slots,
+                                                 int32_t *restrict predicted) {
+  qoamax_assume(samples_size >= 1 && samples_size <= 20);
+  qoamax_assume(width > 0 && width <= QOAMAX_MAX_BEAM_WIDTH);
+  qoamax_assume(scalefactor >= 0 && scalefactor <= 15);
+
+  const int16_t *restrict dqt     = qoamax_dqt[scalefactor];
+  const qoamax_decoder_entry *row = qoamax_decoder_table[scalefactor];
+
+  for (int i = 0; i < samples_size; i++) {
+    int32_t actual_sample = samples[i];
+    int used              = 0;
+    uint64_t max_error    = error_hint; // Candidates need a lower error to enter the beam
+
+    for (int j = 0; j < src_count; j++) {
+      uint64_t current_error = src[j].error;
+      qoamax_lms_regs regs   = qoamax_lms_load(&src[j].lms);
+      int32_t prediction     = qoamax_lms_predict(&regs);
+      predicted[j]           = prediction;
+
+      if (width <= 2) {
+        // With tiny beams, most candidates pass the bound, so checking them all upfront doesn't pay off.
+        for (int codepoint = 0; codepoint < 8; codepoint++) {
+          uint64_t error     = qoamax_error_squared_unclamped(actual_sample, prediction + dqt[codepoint]);
+          uint64_t new_error = qoamax_add_saturating(current_error, error);
+          if (new_error >= max_error) continue;
+
+          qoamax_beam_insert(slots, &used, width, new_error, j, codepoint);
+          if (used == width) max_error = QOAMAX_MIN(max_error, slots.heap[0].error);
+        }
+      } else {
+        // Compute all candidates without branches, then insert the ones below the bound (in codepoint order).
+        uint64_t new_errors[8];
+        unsigned candidates = 0;
+        for (int codepoint = 0; codepoint < 8; codepoint++) {
+          uint64_t error        = qoamax_error_squared_unclamped(actual_sample, prediction + dqt[codepoint]);
+          new_errors[codepoint] = qoamax_add_saturating(current_error, error);
+          candidates |= (unsigned)(new_errors[codepoint] < max_error) << codepoint;
+        }
+
+        for (; candidates; candidates &= candidates - 1) {
+          int codepoint      = __builtin_ctz(candidates);
+          uint64_t new_error = new_errors[codepoint];
+          if (new_error >= max_error) continue; // the bound may have decreased in the meantime
+
+          qoamax_beam_insert(slots, &used, width, new_error, j, codepoint);
+          if (used == width) max_error = QOAMAX_MIN(max_error, slots.heap[0].error);
+        }
+      }
+    }
+
+    if (used == 0) return 0;
+
+    // Construct the surviving nodes (in slot order)
+    qoamax_beam_node *dst = &buffers[(i & 1) * width];
+    for (int slot = 0; slot < used; slot++) {
+      const qoamax_beam_node *parent    = &src[slots.parent[slot]];
+      int codepoint                     = slots.codepoint[slot];
+      const qoamax_decoder_entry *entry = &row[codepoint];
+
+      qoamax_lms_regs regs = qoamax_lms_load(&parent->lms);
+      qoamax_lms_update(&regs, entry, qoamax_clamp_s16(predicted[slots.parent[slot]] + entry->dequantized));
+      qoamax_lms_store(&dst[slot].lms, &regs);
+      dst[slot].error = slots.error[slot];
+
+      if (!first_slice)
+        dst[slot].slice = parent->slice;
+      else if (i == 0)
+        dst[slot].slice = ((uint64_t)scalefactor << 3) | codepoint;
+      else
+        dst[slot].slice = (parent->slice << 3) | codepoint;
+    }
+
+    src       = dst;
+    src_count = used;
+  }
+
+  *out = (qoamax_beam_node *)src;
+  return src_count;
+}
+
+//! See @ref qoamax_encode_beam_search_impl. Wide beams (and unusual widths) get their own function, so that their
+//! large search state is only on the stack when it is used.
+[[gnu::noinline]]
+static int qoamax_encode_beam_search__wide(const qoamax_beam_node *restrict src, int src_count,
+                                           qoamax_beam_node *restrict buffers, int width, bool first_slice,
+                                           int samples_size, const int16_t samples[static restrict samples_size],
+                                           int scalefactor, uint64_t error_hint,
+                                           qoamax_beam_node *restrict *restrict out) {
+  qoamax_beam_heap_entry heap[QOAMAX_MAX_BEAM_WIDTH];
+  uint64_t error[QOAMAX_MAX_BEAM_WIDTH];
+  uint16_t parent[QOAMAX_MAX_BEAM_WIDTH];
+  uint8_t codepoint[QOAMAX_MAX_BEAM_WIDTH];
+  int32_t predicted[QOAMAX_MAX_BEAM_WIDTH];
+  qoamax_beam_slots slots = {heap, error, parent, codepoint};
+  return qoamax_encode_beam_search_impl(src, src_count, buffers, width, first_slice, samples_size, samples, scalefactor,
+                                        error_hint, out, slots, predicted);
+}
+
+//! See @ref qoamax_encode_beam_search_impl. The small beam widths used by the encoder efforts (2, 4 and
+//! QOAMAX_SMALL_BEAM_WIDTH) get their own copies. The caller chooses between this and the wide variant, which keeps
+//! this function free of calls (otherwise gcc's code gets about 3% slower).
+static int qoamax_encode_beam_search(const qoamax_beam_node *restrict src, int src_count,
+                                     qoamax_beam_node *restrict buffers, int width, bool first_slice, int samples_size,
+                                     const int16_t samples[static restrict samples_size], int scalefactor,
+                                     uint64_t error_hint, qoamax_beam_node *restrict *restrict out) {
+  qoamax_beam_heap_entry heap[QOAMAX_SMALL_BEAM_WIDTH];
+  uint64_t error[QOAMAX_SMALL_BEAM_WIDTH];
+  uint16_t parent[QOAMAX_SMALL_BEAM_WIDTH];
+  uint8_t codepoint[QOAMAX_SMALL_BEAM_WIDTH];
+  int32_t predicted[QOAMAX_SMALL_BEAM_WIDTH];
+  qoamax_beam_slots slots = {heap, error, parent, codepoint};
+  switch (width) {
+  case 2:
+    return qoamax_encode_beam_search_impl(src, src_count, buffers, 2, first_slice, samples_size, samples, scalefactor,
+                                          error_hint, out, slots, predicted);
+  case 4:
+    return qoamax_encode_beam_search_impl(src, src_count, buffers, 4, first_slice, samples_size, samples, scalefactor,
+                                          error_hint, out, slots, predicted);
+  default:
+    return qoamax_encode_beam_search_impl(src, src_count, buffers, QOAMAX_SMALL_BEAM_WIDTH, first_slice, samples_size,
+                                          samples, scalefactor, error_hint, out, slots, predicted);
+  }
+}
+
+//! Searches the best scalefactor using a beam search for each one, recursively continuing the search for the
+//! following slices of the lookahead from the resulting nodes. Only results better than error_hint are considered.
+//! `buffers` holds 2 * beam_width nodes per slice of the lookahead, the depth-th slice uses the depth-th part.
+static void qoamax_encode_slice__beam_scalefactor_search(const qoamax_beam_node *src, int src_count,
+                                                         qoamax_beam_node *buffers, int beam_width, int depth,
+                                                         int first_scalefactor, int lookahead,
+                                                         const int16_t samples[static restrict lookahead],
+                                                         uint64_t error_hint, qoamax_beam_node *out_node) {
+  for (int rank = 0; rank < 31; rank++) {
+    int scalefactor = qoamax_outward(first_scalefactor, rank);
+    if ((unsigned)scalefactor >= 16) continue;
+
+    qoamax_beam_node *nodes;
+    bool small      = beam_width == 2 || beam_width == 4 || beam_width == QOAMAX_SMALL_BEAM_WIDTH;
+    int nodes_count = (small ? qoamax_encode_beam_search : qoamax_encode_beam_search__wide)(
+        src, src_count, &buffers[depth * 2 * beam_width], beam_width, depth == 0, QOAMAX_MIN(20, lookahead), samples,
+        scalefactor, error_hint, &nodes);
+    if (nodes_count == 0) continue;
+
+    const qoamax_beam_node *best = &nodes[0];
+    for (int i = 1; i < nodes_count; i++)
+      if (nodes[i].error < best->error) best = &nodes[i];
+    if (best->error >= error_hint) continue;
+
     if (lookahead <= 20) {
-      // uint64_t local_slice;
-      // qoamax_lms local_lms = *lms;
-      // uint64_t local_error = qoamax_encode_hillclimb_search(&local_lms, MIN(20, lookahead), samples,
-      // chosen_scalefactor,
-      //                                                 error_hint, &local_slice);
-    }
-
-    nodes_sizes[depth] = qoamax_encode_beam_search(&nodes[depth], nodes_sizes[depth], beam_width, depth,
-                                                   MIN(20, lookahead), samples, scalefactor, error_hint);
-    if (nodes_sizes[depth] == 0) continue;
-
-    int local_best_index      = 0;
-    uint64_t local_best_error = -1;
-    for (int i = 0; i < nodes_sizes[depth]; i++) {
-      uint64_t error = nodes[depth][i].error;
-      if (error >= local_best_error) continue;
-      local_best_index = i;
-      local_best_error = error;
-    }
-
-    if (local_best_error >= error_hint) continue;
-
-    uint64_t total_error = local_best_error;
-
-    if (lookahead > 20) {
-      qoamax_encoder_node tmp_node;
-      qoamax_encode_slice__beam_scalefactor_search(nodes, nodes_sizes, beam_width, depth + 1, chosen_scalefactor,
-                                                   lookahead - 20, &samples[20], error_hint, &tmp_node);
-      total_error = tmp_node.error;
-    }
-
-    if (total_error < error_hint) {
-      error_hint = total_error;
-      *out_node  = nodes[depth][local_best_index];
+      error_hint = best->error;
+      *out_node  = *best;
+    } else {
+      qoamax_beam_node next_node = {.error = -1};
+      qoamax_encode_slice__beam_scalefactor_search(nodes, nodes_count, buffers, beam_width, depth + 1, scalefactor,
+                                                   lookahead - 20, &samples[20], error_hint, &next_node);
+      if (next_node.error < error_hint) {
+        error_hint = next_node.error;
+        *out_node  = next_node;
+      }
     }
   }
 }
 
-uint64_t qoamax_encode_slice(qoamax_encoder_channel *restrict channel, qoamax_encoder_effort effort, int lookahead,
-                             const int16_t samples[static restrict lookahead]) {
-  qoamax_assume(lookahead >= 1);
+///////////////////////////////////////////////////////////////////////////////
+//                               Final Encoder                               //
+///////////////////////////////////////////////////////////////////////////////
 
-  const int slice_count = (effort & 3) + 1;
-  const int beam_width  = effort >> 2;
+//! ULTRAFAST: hill-climb with the two scalefactors next to the previous one.
+static uint64_t qoamax_encode_slice__ultrafast(qoamax_encoder_channel *restrict channel, int samples_count,
+                                               const int16_t samples[static restrict samples_count]) {
+  uint64_t best_slice = 0;
+  uint64_t best_error = -1;
+  qoamax_lms best_lms = channel->lms;
 
-  // // Fast hillclimb algorithm
-  // if (beam_width == 0 && slice_count == 1) {
-  //   uint64_t best_slice;
-  //   uint64_t best_error = -1;
-  //   qoamax_lms best_lms;
+  // A loop rather than two calls, so the compiler doesn't duplicate the (inlined) hill-climb.
+  for (int offset = -1; offset <= 1; offset += 2) {
+    int scalefactor = (channel->prev_scalefactor + offset) & 15;
 
-  //   for (int scalefactor = 0; scalefactor < 31; scalefactor += 1) {
-  //     int chosen_scalefactor = prev_scalefactor + ((scalefactor >> 1) ^ -(scalefactor & 1));
-  //     if ((unsigned)chosen_scalefactor >= 16) continue;
-  //     // for(int scalefactor = 0; scalefactor <= 2; scalefactor += 2) {
-  //     //   int chosen_scalefactor = prev_scalefactor + scalefactor - 1;
-
-  //     qoamax_lms hillclimb_lms = channel->lms;
-  //     uint64_t hillclimb_slice;
-  //     uint64_t error = qoamax_encode_hillclimb_search(&hillclimb_lms, MIN(20, lookahead), samples,
-  //     chosen_scalefactor,
-  //                                                     best_error, &hillclimb_slice);
-
-  //     if (error < best_error) {
-  //       best_error = error;
-  //       best_slice = hillclimb_slice;
-  //       best_lms   = hillclimb_lms;
-  //     }
-  //   }
-
-  //   channel->lms              = best_lms;
-  //   channel->prev_scalefactor = best_slice >> 60;
-  //   channel->error += best_error;
-  //   return best_slice;
-  // }
-
-  if (beam_width == 0) {
+    qoamax_lms lms = channel->lms;
     uint64_t slice;
-    uint64_t error;
-    qoamax_encode_slice__hillclimb_scalefactor_search(&channel->lms, channel->prev_scalefactor,
-                                                      MIN(lookahead, 20 * slice_count), samples, -1, &slice, &error);
-
-    channel->prev_scalefactor = slice >> 60;
-    channel->error += error;
-    return slice;
-  } else {
-    constexpr int W = 1024;
-    constexpr int L = 5;
-
-    qoamax_encoder_node nodes_storage[W * L + 1];
-    qoamax_encoder_node *nodes[L + 1];
-    int nodes_sizes[L];
-
-    // Initialize encoder nodes
-    for (int i = 1; i <= L; i++) nodes[i] = &nodes_storage[i * beam_width];
-
-    // Initial node
-    nodes_storage[W * L].error = 0;
-    nodes_storage[W * L].lms   = channel->lms;
-    nodes[0]                   = &nodes_storage[W * L];
-    nodes_sizes[0]             = 1;
-
-    qoamax_encoder_node best_node;
-    qoamax_encode_slice__beam_scalefactor_search(&nodes[1], &nodes_sizes[1], beam_width, 0, channel->prev_scalefactor,
-                                                 MIN(lookahead, 20 * slice_count), samples, -1, &best_node);
-
-    int16_t out_samples[20];
-    qoamax_decode_slice(&channel->lms, best_node.slices[0], out_samples);
-
-    for (int i = 0; i < MIN(lookahead, 20); i++) {
-      channel->error += qoamax_error_squared(samples[i], out_samples[i]);
+    uint64_t error = qoamax_encode_hillclimb_search(&lms, samples_count, samples, scalefactor, best_error, &slice);
+    if (error < best_error) {
+      best_error = error;
+      best_slice = slice;
+      best_lms   = lms;
     }
-
-    channel->prev_scalefactor = best_node.slices[0] >> 60;
-    return best_node.slices[0];
   }
+
+  channel->lms              = best_lms;
+  channel->prev_scalefactor = best_slice >> 60;
+  channel->error += best_error;
+  return best_slice;
+}
+
+//! SUPERFAST, VERYFAST: hill-climb with the best scalefactors over the lookahead.
+static uint64_t qoamax_encode_slice__hillclimb(qoamax_encoder_channel *restrict channel, int lookahead,
+                                               const int16_t samples[static restrict lookahead]) {
+  uint64_t slice;
+  uint64_t error;
+#if QOAMAX_LANES == 1
+  qoamax_encode_slice__hillclimb_scalefactor_search_scalar(&channel->lms, channel->prev_scalefactor, lookahead, samples,
+                                                           UINT64_MAX, &slice, &error);
+#else
+  qoamax_encode_slice__hillclimb_scalefactor_search_lanes(&channel->lms, channel->prev_scalefactor, lookahead, samples,
+                                                          UINT64_MAX, &slice, &error);
+#endif
+
+  channel->prev_scalefactor = slice >> 60;
+  channel->error += error;
+  return slice;
+}
+
+//! See @ref qoamax_encode_slice__beam_scalefactor_search. The node buffers of wide beams (about 320 KB) are only on
+//! the stack while this function runs.
+[[gnu::noinline]]
+static void qoamax_encode_slice__beam_scalefactor_search_wide(const qoamax_beam_node *root, int beam_width,
+                                                              int first_scalefactor, int lookahead,
+                                                              const int16_t samples[static restrict lookahead],
+                                                              uint64_t error_hint, qoamax_beam_node *out_node) {
+  qoamax_beam_node buffers[QOAMAX_MAX_LOOKAHEAD_SLICES * 2 * QOAMAX_MAX_BEAM_WIDTH];
+  qoamax_encode_slice__beam_scalefactor_search(root, 1, buffers, beam_width, 0, first_scalefactor, lookahead, samples,
+                                               error_hint, out_node);
+}
+
+//! FAST to PLACEBO: beam search for every scalefactor over the lookahead.
+static uint64_t qoamax_encode_slice__beam(qoamax_encoder_channel *restrict channel, int beam_width, int lookahead,
+                                          const int16_t samples[static restrict lookahead]) {
+  // The (unclamped) hill-climb result bounds the beam search, which then only has to look for better results.
+  qoamax_lms hillclimb_lms = channel->lms;
+  uint64_t hillclimb_slice, hillclimb_first_error;
+#if QOAMAX_LANES == 1
+  uint64_t hillclimb_error = qoamax_encode_slice__hillclimb_scalefactor_search_scalar_unclamped(
+      &hillclimb_lms, channel->prev_scalefactor, lookahead, samples, UINT64_MAX, &hillclimb_slice,
+      &hillclimb_first_error);
+#else
+  uint64_t hillclimb_error = qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped(
+      &hillclimb_lms, channel->prev_scalefactor, lookahead, samples, UINT64_MAX, &hillclimb_slice,
+      &hillclimb_first_error);
+#endif
+
+  qoamax_beam_node root = {.error = 0, .slice = 0, .lms = channel->lms};
+  qoamax_beam_node best = {.error = -1};
+  int slices            = (lookahead + 19) / 20; // depth of the search
+  if (slices * 2 * beam_width <= QOAMAX_SMALL_BEAM_NODES) {
+    qoamax_beam_node buffers[QOAMAX_SMALL_BEAM_NODES];
+    qoamax_encode_slice__beam_scalefactor_search(&root, 1, buffers, beam_width, 0, channel->prev_scalefactor, lookahead,
+                                                 samples, hillclimb_error, &best);
+  } else {
+    qoamax_encode_slice__beam_scalefactor_search_wide(&root, beam_width, channel->prev_scalefactor, lookahead, samples,
+                                                      hillclimb_error, &best);
+  }
+
+  // Use the hill-climb result unless the beam search found a better one.
+  // A partial slice (end of the stream) must be left-aligned like a full one.
+  int samples_count = QOAMAX_MIN(lookahead, 20);
+  uint64_t slice    = best.error > hillclimb_error ? hillclimb_slice : best.slice << ((20 - samples_count) * 3);
+
+  int16_t decoded[20];
+  qoamax_decode_slice(&channel->lms, slice, decoded);
+  for (int i = 0; i < samples_count; i++) channel->error += qoamax_error_squared(samples[i], decoded[i]);
+
+  channel->prev_scalefactor = slice >> 60;
+  return slice;
+}
+
+uint64_t qoamax_encode_slice(qoamax_encoder_channel *restrict channel, qoamax_encoder_effort effort, int samples_size,
+                             const int16_t samples[static restrict samples_size]) {
+  qoamax_assume(samples_size >= 1);
+
+  int lookahead  = QOAMAX_MIN(samples_size, qoamax_encoder_effort_get_lookahead(effort));
+  int beam_width = effort >> 2;
+
+  if (effort < 0) return qoamax_encode_slice__ultrafast(channel, QOAMAX_MIN(samples_size, 20), samples);
+  if (beam_width == 0) return qoamax_encode_slice__hillclimb(channel, lookahead, samples);
+  return qoamax_encode_slice__beam(channel, beam_width, lookahead, samples);
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 //                                File Format                                //
 ///////////////////////////////////////////////////////////////////////////////
 
-static inline uint64_t qoamax__read_u64be(const char *data) {
-#if QOAMAX_FILE_ALIGNED && __STDC_ENDIAN_NATIVE__ == __STDC_ENDIAN_LITTLE__
-  return __builtin_bswap64(*((uint64_t *)data));
-#elif QOAMAX_FILE_ALIGNED && __STDC_ENDIAN_NATIVE__ == __STDC_ENDIAN_BIG__
-  return *((uint64_t *)data);
-#else
-  uint64_t ret = 0;
-  for (int i = 0; i < 8; i++) ret = (ret << 8) | ((uint8_t)(*data++));
-  return ret;
-#endif
+#define QOAMAX_MAGIC 0x716F6166 //!< "qoaf"
+
+//! Reads a big-endian 64-bit word and advances *data past it.
+static inline uint64_t qoamax__read_u64be(const char *restrict *restrict data) {
+  uint64_t value = 0;
+  for (int i = 0; i < 8; i++) value = (value << 8) | (uint8_t)(*data)[i];
+  *data += 8;
+  return value;
 }
 
-static inline void qoamax__write_u64be(char *out, uint64_t chunk) {
-#if QOAMAX_FILE_ALIGNED && __STDC_ENDIAN_NATIVE__ == __STDC_ENDIAN_LITTLE__
-  *((uint64_t *)out) = __builtin_bswap64(chunk);
-#elif QOAMAX_FILE_ALIGNED && __STDC_ENDIAN_NATIVE__ == __STDC_ENDIAN_BIG__
-  *((uint64_t *)out) = chunk;
-#else
-  for (int i = 0; i < 8; i++) {
-    *out++ = chunk >> 56;
-    chunk <<= 8;
-  }
-#endif
+//! Writes a big-endian 64-bit word and advances *out past it.
+static inline void qoamax__write_u64be(char *restrict *restrict out, uint64_t value) {
+  for (int i = 0; i < 8; i++) (*out)[i] = (char)(value >> (56 - 8 * i));
+  *out += 8;
 }
 
-static int qoamax_decoder_read_file_header(qoamax_decoder *restrict self, const char *restrict *restrict header,
-                                           uint32_t *total_sample_count) {
-  uint64_t file_header = qoamax__read_u64be(*header);
-  *header += 8;
-
-  if ((file_header >> 32) != 0x716F6166) return -EINVAL;
-
-  *total_sample_count = (uint32_t)file_header;
-
-  return 0;
+//! The size of a frame in bytes: the frame header, every channel's LMS state (history, weights) and the slices.
+static inline uint32_t qoamax__frame_size(int channel_count, int samples_per_channel) {
+  return 8 * (1 + channel_count * (2 + (samples_per_channel + 19) / 20));
 }
 
-static int qoamax_decoder_read_frame_header(qoamax_decoder *restrict self, const char *restrict *restrict header) {
-  uint64_t frame_header = qoamax__read_u64be(*header);
-  *header += 8;
+typedef struct {
+  uint8_t channel_count;
+  int32_t samplerate;
+  uint16_t samples_per_channel;
+  uint16_t size; //!< In bytes
+} qoamax_frame_header;
 
-  uint8_t channel_count        = frame_header >> 56;
-  uint32_t samplerate          = frame_header << 8 >> 40;
-  uint32_t samples_per_channel = frame_header << 32 >> 48;
-  uint32_t frame_bytesize      = frame_header << 48 >> 48;
+static inline qoamax_frame_header qoamax__parse_frame_header(uint64_t header) {
+  return (qoamax_frame_header){
+      .channel_count       = header >> 56,
+      .samplerate          = (header >> 32) & 0xFFFFFF,
+      .samples_per_channel = header >> 16,
+      .size                = header,
+  };
+}
 
-  if (channel_count != self->channel_count) return -EINVAL;
-  if (samplerate != self->samplerate) return -EINVAL;
+static int qoamax_decoder_read_frame_header(qoamax_decoder *restrict self, const char *restrict *restrict file) {
+  qoamax_frame_header header = qoamax__parse_frame_header(qoamax__read_u64be(file));
+  if (header.channel_count != self->channel_count) return QOAMAX_ERROR_SAMPLE_FORMAT_BREAK;
+  if (header.samplerate != self->samplerate) return QOAMAX_ERROR_SAMPLE_FORMAT_BREAK;
 
-  qoamax_assume(channel_count >= 1 && channel_count <= QOAMAX_MAX_CHANNEL_COUNT);
+  qoamax_assume(header.channel_count >= 1 && header.channel_count <= QOAMAX_MAX_CHANNEL_COUNT);
 
-  int32_t total_slices = frame_bytesize / 8 - (2 * channel_count) - 1;
-  self->frame_samples  = samples_per_channel;
-  self->slice_pos      = total_slices / channel_count;
+  // The frame size is fully determined by the sample count; padding slices are not allowed.
+  if (header.samples_per_channel == 0 || header.samples_per_channel > QOAMAX_FRAME_SAMPLES)
+    return QOAMAX_ERROR_INVALID_FRAME_HEADER;
+  if (header.size != qoamax__frame_size(header.channel_count, header.samples_per_channel))
+    return QOAMAX_ERROR_INVALID_FRAME_HEADER;
 
-  if (total_slices != self->slice_pos * channel_count) return -EINVAL;
-  if (samples_per_channel > (self->slice_pos * 20)) return -EINVAL;
+  self->frame_samples = header.samples_per_channel;
 
-  for (int i = 0; i < channel_count; i++) {
-    uint64_t history = qoamax__read_u64be(*header);
-    *header += 8;
-    uint64_t weights = qoamax__read_u64be(*header);
-    *header += 8;
-
-    for (int j = 0; j < 4; j++) {
-      self->lms[i].history[j] = (int16_t)(history >> 48);
+  for (int ch = 0; ch < header.channel_count; ch++) {
+    uint64_t history = qoamax__read_u64be(file);
+    uint64_t weights = qoamax__read_u64be(file);
+    for (int i = 0; i < 4; i++) {
+      self->lms[ch].history[i] = (int16_t)(history >> 48);
+      self->lms[ch].weights[i] = (int16_t)(weights >> 48);
       history <<= 16;
-    }
-    for (int j = 0; j < 4; j++) {
-      self->lms[i].weights[j] = (int16_t)(weights >> 48);
       weights <<= 16;
     }
   }
@@ -530,258 +1066,227 @@ static int qoamax_decoder_read_frame_header(qoamax_decoder *restrict self, const
   return 0;
 }
 
-int qoamax_decoder_init(qoamax_decoder *restrict self, int file_size, const char *restrict *restrict file,
+int qoamax_decoder_init(qoamax_decoder *restrict self, size_t file_size, const char *restrict *restrict file,
                         qoamax_decoder_query *query) {
-  uint32_t total_sample_count;
-  int err = qoamax_decoder_read_file_header(self, file, &total_sample_count);
-  if (err) return err;
+  if (file_size < 16) return QOAMAX_ERROR_INVALID_ARGUMENT;
 
-  uint64_t frame_header = qoamax__read_u64be(*file);
+  uint64_t file_header = qoamax__read_u64be(file);
+  if ((file_header >> 32) != QOAMAX_MAGIC) return QOAMAX_ERROR_INVALID_FILE_HEADER;
 
-  uint8_t channel_count        = frame_header >> 56;
-  uint32_t samplerate          = frame_header << 8 >> 40;
-  uint32_t samples_per_channel = frame_header << 32 >> 48;
-  uint32_t frame_bytesize      = frame_header << 48 >> 48;
+  // Only peek at the first frame header to get the stream's format; qoamax_decoder_read reads it again.
+  const char *frame          = *file;
+  qoamax_frame_header header = qoamax__parse_frame_header(qoamax__read_u64be(&frame));
 
-  if (channel_count > QOAMAX_MAX_CHANNEL_COUNT) return -ENOMEM;
-  if (channel_count < 1) return -EINVAL;
+  if (header.channel_count < 1 || header.channel_count > 31) return QOAMAX_ERROR_INVALID_FILE_HEADER;
+  if (header.channel_count > QOAMAX_MAX_CHANNEL_COUNT) return QOAMAX_ERROR_UNSUPPORTED_CHANNEL_COUNT;
 
-  query->total_samples = total_sample_count;
-  query->samplerate    = samplerate;
-  query->channel_count = channel_count;
-  self->slice_pos      = 0;
-  self->channel_count  = channel_count;
-  self->samplerate     = samplerate;
-  (void)samples_per_channel;
-  (void)frame_bytesize;
+  query->total_samples = (uint32_t)file_header;
+  query->samplerate    = header.samplerate;
+  query->channel_count = header.channel_count;
+  self->frame_samples  = 0;
+  self->channel_count  = header.channel_count;
+  self->samplerate     = header.samplerate;
 
   return 0;
 }
 
-int qoamax_decoder_read(qoamax_decoder *restrict self, int file_size, const char *restrict *restrict file,
+//! Prepares decoding the next slice of every channel, reading a frame header first if necessary.
+//! @returns the slice's sample count per channel, 0 if the file or the output space runs out, or an error code.
+static int qoamax_decoder_begin_slice(qoamax_decoder *restrict self, const char *restrict *restrict file,
+                                      const char *file_end, size_t samples_per_channel) {
+  if (self->frame_samples == 0) {
+    if (file_end - *file < 8 * (1 + 2 * self->channel_count)) return 0;
+
+    int err = qoamax_decoder_read_frame_header(self, file);
+    if (err) return err;
+  }
+
+  int slice_size = QOAMAX_MIN(20, self->frame_samples);
+  if (file_end - *file < 8 * self->channel_count) return 0;
+  if (samples_per_channel < (size_t)slice_size) return 0;
+
+  self->frame_samples -= slice_size;
+  return slice_size;
+}
+
+int qoamax_decoder_read(qoamax_decoder *restrict self, size_t file_size, const char *restrict *restrict file,
                         size_t samples_per_channel, int16_t *restrict samples[static restrict self->channel_count]) {
   qoamax_assume(self->channel_count >= 1 && self->channel_count <= QOAMAX_MAX_CHANNEL_COUNT);
 
   const char *file_end = *file + file_size;
 
   while (true) {
-    if (self->slice_pos == 0) {
-      if (*file + 8 * (1 + self->channel_count) > file_end) return 0;
+    int slice_size = qoamax_decoder_begin_slice(self, file, file_end, samples_per_channel);
+    if (slice_size <= 0) return slice_size;
 
-      int err = qoamax_decoder_read_frame_header(self, file);
-      if (err) return err;
-    } else {
-      int slice_size = MIN(20, self->frame_samples);
-      if (((file_end - *file) / 8) < self->channel_count) return 0;
-      if (samples_per_channel < slice_size) return 0;
-
-      self->slice_pos -= 1;
-      self->frame_samples -= slice_size;
-      samples_per_channel -= slice_size;
-
-      for (int channel = 0; channel < self->channel_count; channel++) {
-        uint64_t slice = qoamax__read_u64be(*file);
-        *file += 8;
-        qoamax_decode_slice(&self->lms[channel], slice, samples[channel]);
-        samples[channel] += slice_size;
+    for (int ch = 0; ch < self->channel_count; ch++) {
+      uint64_t slice = qoamax__read_u64be(file);
+      if (samples_per_channel >= 20) {
+        qoamax_decode_slice(&self->lms[ch], slice, samples[ch]);
+      } else {
+        // Less than a full slice of space left: decode into a temporary buffer to not write out of bounds.
+        int16_t tmp[20];
+        qoamax_decode_slice(&self->lms[ch], slice, tmp);
+        memcpy(samples[ch], tmp, slice_size * sizeof(int16_t));
       }
+      samples[ch] += slice_size;
     }
+
+    samples_per_channel -= slice_size;
   }
 }
 
-int qoamax_decoder_read_interleaved(qoamax_decoder *restrict self, int file_size, const char *restrict *restrict file,
-                                    size_t samples_size, int16_t *restrict samples[static restrict 1]) {
+int qoamax_decoder_read_interleaved(qoamax_decoder *restrict self, size_t file_size,
+                                    const char *restrict *restrict file, size_t samples_size,
+                                    int16_t *restrict samples[static restrict 1]) {
   if (self->channel_count == 1) return qoamax_decoder_read(self, file_size, file, samples_size, samples);
 
   qoamax_assume(self->channel_count >= 1 && self->channel_count <= QOAMAX_MAX_CHANNEL_COUNT);
 
-  const char *file_end    = *file + file_size;
-  int samples_per_channel = samples_size / self->channel_count;
+  const char *file_end       = *file + file_size;
+  size_t samples_per_channel = samples_size / self->channel_count;
 
   while (true) {
-    if (self->slice_pos == 0) {
-      if ((*file + 8 * (1 + self->channel_count)) > file_end) return 0;
+    int slice_size = qoamax_decoder_begin_slice(self, file, file_end, samples_per_channel);
+    if (slice_size <= 0) return slice_size;
 
-      int err = qoamax_decoder_read_frame_header(self, file);
-      if (err) return err;
+    if (slice_size == 20) {
+      // Full slices are decoded directly into the output.
+      for (int ch = 0; ch < self->channel_count; ch++)
+        qoamax_decode_slice__interleaved(&self->lms[ch], qoamax__read_u64be(file), &(*samples)[ch],
+                                         self->channel_count);
+      *samples += 20 * self->channel_count;
     } else {
-      int slice_size = MIN(20, self->frame_samples);
-      if (((file_end - *file) / 8) < self->channel_count) return 0;
-      if (samples_per_channel < slice_size) return 0;
+      // The last slice of a frame may be shorter: decode it into a temporary buffer.
+      int16_t decoded[QOAMAX_MAX_CHANNEL_COUNT][20];
+      for (int ch = 0; ch < self->channel_count; ch++)
+        qoamax_decode_slice(&self->lms[ch], qoamax__read_u64be(file), decoded[ch]);
 
-      self->slice_pos -= 1;
-      self->frame_samples -= slice_size;
-      samples_per_channel -= slice_size;
-
-      int16_t interleaving[20 * QOAMAX_MAX_CHANNEL_COUNT];
-
-      int16_t *interleaving_pos = interleaving;
-      for (int channel = 0; channel < self->channel_count; channel++) {
-        uint64_t slice = qoamax__read_u64be(*file);
-        *file += 8;
-        qoamax_decode_slice(&self->lms[channel], slice, interleaving_pos);
-        interleaving_pos += 20;
-      }
-
-      for (int i = 0; i < slice_size; i++) {
-        interleaving_pos = interleaving + i;
-        for (int channel = 0; channel < self->channel_count; channel++) {
-          *(*samples)++ = *interleaving_pos;
-          interleaving_pos += 20;
-        }
-      }
+      for (int i = 0; i < slice_size; i++)
+        for (int ch = 0; ch < self->channel_count; ch++) *(*samples)++ = decoded[ch][i];
     }
+
+    samples_per_channel -= slice_size;
   }
 }
 
 int qoamax_encoder_init(qoamax_encoder *restrict self, qoamax_encoder_effort effort, int channel_count,
                         uint32_t total_samples, int32_t samplerate) {
-  if (channel_count < 1 || channel_count > 8) return -EINVAL;
-  if ((samplerate >> 24) != 0) return -EINVAL;
+  if (channel_count < 1 || channel_count > 31) return QOAMAX_ERROR_INVALID_ARGUMENT;
+  if (channel_count > QOAMAX_MAX_CHANNEL_COUNT) return QOAMAX_ERROR_UNSUPPORTED_CHANNEL_COUNT;
+  if ((samplerate >> 24) != 0) return QOAMAX_ERROR_INVALID_ARGUMENT;
 
   self->effort         = effort;
   self->channel_count  = channel_count;
   self->total_samples  = total_samples;
   self->samplerate     = samplerate;
-  self->slice_pos      = 0;
+  self->frame_slices   = 0;
   self->header_written = false;
 
   for (int i = 0; i < channel_count; i++) {
     self->channels[i].lms              = QOAMAX_LMS_INITIAL;
     self->channels[i].error            = 0;
     self->channels[i].prev_scalefactor = 0;
-    for (int j = 0; j < 3; j++) self->channels[i].cache[j] = 0;
   }
 
   return 0;
 }
 
-static void qoamax_encoder_write_file_header(const qoamax_encoder *restrict self, char *restrict *restrict out) {
-  uint64_t file_header = (0x716F6166LLU << 32) | (self->total_samples << 0);
-  qoamax__write_u64be(*out, file_header);
-  *out += 8;
-}
-
-static void qoamax_encoder_write_frame_header(qoamax_encoder *restrict self, char *restrict *restrict out,
+static void qoamax_encoder_write_frame_header(const qoamax_encoder *restrict self, char *restrict *restrict out,
                                               int samples_per_channel) {
-  uint64_t frame_header = (((uint64_t)self->channel_count) << 56) | (((uint64_t)self->samplerate) << 32) |
-                          (((uint64_t)samples_per_channel) << 16) |
-                          (((1 + self->channel_count * (self->slice_pos + 2)) * 8) << 0);
-  qoamax__write_u64be(*out, frame_header);
-  *out += 8;
+  uint64_t frame_header = (uint64_t)self->channel_count << 56 | (uint64_t)self->samplerate << 32 |
+                          (uint64_t)samples_per_channel << 16 |
+                          qoamax__frame_size(self->channel_count, samples_per_channel);
+  qoamax__write_u64be(out, frame_header);
 
   for (int ch = 0; ch < self->channel_count; ch++) {
-    qoamax_lms *lms = &self->channels[ch].lms;
-
-    uint64_t channel_history;
-    for (int i = 0; i < 4; i++) channel_history = (channel_history << 16) | ((uint16_t)lms->history[i]);
-    qoamax__write_u64be(*out, channel_history);
-    *out += 8;
-
-    uint64_t channel_weights;
+    const qoamax_lms *lms = &self->channels[ch].lms;
+    uint64_t history = 0, weights = 0;
     for (int i = 0; i < 4; i++) {
-      lms->weights[i] = (lms->weights[i] << 16 >> 16);
-      channel_weights = (channel_weights << 16) | ((uint16_t)lms->weights[i]);
+      history = (history << 16) | (uint16_t)lms->history[i];
+      weights = (weights << 16) | (uint16_t)lms->weights[i];
     }
-    qoamax__write_u64be(*out, channel_weights);
-    *out += 8;
+    qoamax__write_u64be(out, history);
+    qoamax__write_u64be(out, weights);
   }
 }
 
-int qoamax_encoder_write(qoamax_encoder *restrict self, size_t file_size, char *restrict *restrict file,
-                         int samples_per_channel, const int16_t *restrict samples[static restrict self->channel_count],
-                         bool samples_complete) {
-  qoamax_assume(samples_per_channel >= 0);
-
-  int lookahead   = qoamax_encoder_effort_get_lookahead(self->effort);
-  int min_samples = samples_complete ? 1 : lookahead;
-
-  char *file_end = *file + file_size;
-
-  while (true) {
-    if (self->slice_pos == 0) {
-      if (!self->header_written) {
-        if ((file_end - *file) < 8) return 0;
-        qoamax_encoder_write_file_header(self, file);
-        self->header_written = true;
-      }
-
-      if ((file_end - *file) < 8 * (1 + self->channel_count * 2)) return 0;
-      if (samples_per_channel < 5120 && (!samples_complete || samples_per_channel <= 0)) return 0;
-      int upcoming_samples = MIN(samples_per_channel, 5120);
-      self->slice_pos      = (upcoming_samples + 19) / 20;
-
-      qoamax_encoder_write_frame_header(self, file, upcoming_samples);
-    } else {
-      if (((file_end - *file) / 8) < self->channel_count) return 0;
-      if (samples_per_channel < min_samples) return 0;
-
-      for (int ch = 0; ch < self->channel_count; ch++) {
-        uint64_t slice =
-            qoamax_encode_slice(&self->channels[ch], self->effort, MIN(lookahead, samples_per_channel), samples[ch]);
-        samples[ch] += MIN(20, samples_per_channel);
-
-        qoamax__write_u64be(*file, slice);
-        *file += 8;
-      }
-
-      self->slice_pos -= 1;
-      samples_per_channel -= 20;
+//! Prepares encoding the next slice of every channel, writing the file and frame headers first if necessary.
+//! @returns whether the next slice can be encoded (false if the input or the output space runs out).
+static bool qoamax_encoder_begin_slice(qoamax_encoder *restrict self, char *restrict *restrict file,
+                                       const char *file_end, size_t samples_per_channel, bool samples_complete) {
+  if (self->frame_slices == 0) {
+    // The frame header holds the frame's sample count, so all its samples must be available (or the stream ends).
+    // The file header is only written along with the first frame, as a QOA file can't be empty.
+    if (samples_per_channel < QOAMAX_FRAME_SAMPLES && (!samples_complete || samples_per_channel == 0)) return false;
+    if (file_end - *file < 8 * (1 + 2 * self->channel_count) + (self->header_written ? 0 : 8)) return false;
+    if (!self->header_written) {
+      qoamax__write_u64be(file, (uint64_t)QOAMAX_MAGIC << 32 | self->total_samples);
+      self->header_written = true;
     }
+
+    int frame_samples  = QOAMAX_MIN(samples_per_channel, QOAMAX_FRAME_SAMPLES);
+    self->frame_slices = (frame_samples + 19) / 20;
+
+    // The file stores the LMS weights as int16. The encoder must continue from the same state as the decoder.
+    for (int ch = 0; ch < self->channel_count; ch++)
+      for (int i = 0; i < 4; i++) self->channels[ch].lms.weights[i] = (int16_t)self->channels[ch].lms.weights[i];
+
+    qoamax_encoder_write_frame_header(self, file, frame_samples);
+  }
+
+  size_t min_samples = samples_complete ? 1 : qoamax_encoder_effort_get_lookahead(self->effort);
+  return file_end - *file >= 8 * self->channel_count && samples_per_channel >= min_samples;
+}
+
+int qoamax_encoder_write(qoamax_encoder *restrict self, size_t file_size, char *restrict *restrict file,
+                         size_t samples_per_channel,
+                         const int16_t *restrict samples[static restrict self->channel_count], bool samples_complete) {
+  size_t lookahead = qoamax_encoder_effort_get_lookahead(self->effort);
+  char *file_end   = *file + file_size;
+
+  while (qoamax_encoder_begin_slice(self, file, file_end, samples_per_channel, samples_complete)) {
+    int slice_size = QOAMAX_MIN(20, samples_per_channel);
+    for (int ch = 0; ch < self->channel_count; ch++) {
+      uint64_t slice = qoamax_encode_slice(&self->channels[ch], self->effort,
+                                           QOAMAX_MIN(lookahead, samples_per_channel), samples[ch]);
+      qoamax__write_u64be(file, slice);
+      samples[ch] += slice_size;
+    }
+
+    self->frame_slices -= 1;
+    samples_per_channel -= slice_size;
   }
 
   return 0;
 }
 
 int qoamax_encoder_write_interleaved(qoamax_encoder *restrict self, size_t file_size, char *restrict *restrict file,
-                                     int samples_size, const int16_t *restrict samples[static restrict 1],
+                                     size_t samples_size, const int16_t *restrict samples[static restrict 1],
                                      bool samples_complete) {
-  qoamax_assume(samples_size >= 0);
   if (self->channel_count == 1)
     return qoamax_encoder_write(self, file_size, file, samples_size, samples, samples_complete);
 
-  int lookahead           = qoamax_encoder_effort_get_lookahead(self->effort);
-  int min_samples         = samples_complete ? 1 : lookahead;
-  int samples_per_channel = samples_size / self->channel_count;
+  size_t lookahead           = qoamax_encoder_effort_get_lookahead(self->effort);
+  size_t samples_per_channel = samples_size / self->channel_count;
+  char *file_end             = *file + file_size;
 
-  char *file_end = *file + file_size;
+  while (qoamax_encoder_begin_slice(self, file, file_end, samples_per_channel, samples_complete)) {
+    int slice_size           = QOAMAX_MIN(20, samples_per_channel);
+    int channel_samples_size = QOAMAX_MIN(lookahead, samples_per_channel);
 
-  while (true) {
-    if (self->slice_pos == 0) {
-      if (!self->header_written) {
-        if ((file_end - *file) < 8) return 0;
-        qoamax_encoder_write_file_header(self, file);
-        self->header_written = true;
-      }
+    for (int ch = 0; ch < self->channel_count; ch++) {
+      int16_t channel_samples[QOAMAX_MAX_LOOKAHEAD_SLICES * 20];
+      for (int i = 0; i < channel_samples_size; i++) channel_samples[i] = (*samples)[i * self->channel_count + ch];
 
-      if ((file_end - *file) < 8 * (1 + self->channel_count * 2)) return 0;
-      if (samples_per_channel < 5120 && (!samples_complete || samples_per_channel <= 0)) return 0;
-      int upcoming_samples = MIN(samples_per_channel, 5120);
-      self->slice_pos      = (upcoming_samples + 19) / 20;
-
-      qoamax_encoder_write_frame_header(self, file, upcoming_samples);
-    } else {
-      if (((file_end - *file) / 8) < self->channel_count) return 0;
-      if (samples_per_channel < min_samples) return 0;
-
-      for (int ch = 0; ch < self->channel_count; ch++) {
-        int16_t channel_samples[80];
-        const int16_t *samples_channel = &(*samples)[ch];
-
-        for (int i = 0; i < MIN(lookahead, samples_per_channel); i++) {
-          channel_samples[i] = *samples_channel;
-          samples_channel += self->channel_count;
-        }
-
-        uint64_t slice = qoamax_encode_slice(&self->channels[ch], self->effort, MIN(lookahead, samples_per_channel),
-                                             channel_samples);
-        qoamax__write_u64be(*file, slice);
-        *file += 8;
-      }
-
-      *samples += MIN(20, samples_per_channel) * self->channel_count;
-      self->slice_pos -= 1;
-      samples_per_channel -= 20;
+      uint64_t slice = qoamax_encode_slice(&self->channels[ch], self->effort, channel_samples_size, channel_samples);
+      qoamax__write_u64be(file, slice);
     }
+
+    *samples += slice_size * self->channel_count;
+    self->frame_slices -= 1;
+    samples_per_channel -= slice_size;
   }
+
+  return 0;
 }

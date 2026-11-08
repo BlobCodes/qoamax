@@ -13,6 +13,9 @@ QOAMAX implements multiple parametrizable encoders,
 ranging from being 5x as fast as the reference encoder to
 trading hours of compute for large quality improvements.
 
+On a pop song, the tradeoff currently looks like this (Ryzen 5900X, both using `-march=native -mtune=native`, placebo missing):  
+![Graph showing the speed-quality tradeoff](assets/qoa_pareto.svg)
+
 ## Compilation
 
 Simply run `make` inside the repo root to build the CLI tool.

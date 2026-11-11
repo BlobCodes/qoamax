@@ -55,6 +55,7 @@ static const int16_t qoamax_qt[16][3] = {QOAMAX_DQT_ROWS(QOAMAX_QT_ROW)};
 #define qoamax_assume(x) ((x) ? (void)0 : unreachable())
 
 #define QOAMAX_MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define QOAMAX_MAX(a, b) (((a) > (b)) ? (a) : (b))
 
 // Fully unrolls the 20-sample loops, unless the compiler optimizes for size (-Os, -Oz).
 #define QOAMAX_PRAGMA(x) _Pragma(#x)
@@ -379,23 +380,24 @@ static_assert(QOAMAX_LANES >= 1 && QOAMAX_LANES <= 16 && 16 % QOAMAX_LANES == 0)
 #if QOAMAX_LANES > 1
 
 //! qoamax_dqt (positive values) and qoamax_qt transposed, so that a vector can hold one scalefactor per lane.
+//! The 16 columns are repeated, so that a lane window wrapping around from scalefactor 15 to 0 is one load.
 #define QOAMAX_COLUMN_A(a, b, c, d) a,
-#define QOAMAX_COLUMN_B(a, b, c, d) b,
-#define QOAMAX_COLUMN_C(a, b, c, d) c,
-#define QOAMAX_COLUMN_D(a, b, c, d) d,
+#define QOAMAX_COLUMN_B(a, b, c, d) (b) - (a),
+#define QOAMAX_COLUMN_C(a, b, c, d) (c) - (b),
+#define QOAMAX_COLUMN_D(a, b, c, d) (d) - (c),
 #define QOAMAX_COLUMN_AB(a, b, c, d) ((a) + (b)) / 2,
 #define QOAMAX_COLUMN_BC(a, b, c, d) ((b) + (c)) / 2,
 #define QOAMAX_COLUMN_CD(a, b, c, d) ((c) + (d)) / 2,
-static const int32_t qoamax_lanes_dqt[4][16] = {
-    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_A)},
-    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_B)},
-    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_C)},
-    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_D)},
+static const int32_t qoamax_lanes_dqt[4][32] = {
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_A) QOAMAX_DQT_ROWS(QOAMAX_COLUMN_A)},
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_B) QOAMAX_DQT_ROWS(QOAMAX_COLUMN_B)},
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_C) QOAMAX_DQT_ROWS(QOAMAX_COLUMN_C)},
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_D) QOAMAX_DQT_ROWS(QOAMAX_COLUMN_D)},
 };
-static const int32_t qoamax_lanes_qt[3][16] = {
-    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_AB)},
-    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_BC)},
-    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_CD)},
+static const int32_t qoamax_lanes_qt[3][32] = {
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_AB) QOAMAX_DQT_ROWS(QOAMAX_COLUMN_AB)},
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_BC) QOAMAX_DQT_ROWS(QOAMAX_COLUMN_BC)},
+    {QOAMAX_DQT_ROWS(QOAMAX_COLUMN_CD) QOAMAX_DQT_ROWS(QOAMAX_COLUMN_CD)},
 };
 
 //! Inverse of @ref qoamax_outward: the position of value in the search order around center.
@@ -407,7 +409,8 @@ static inline int qoamax_outward_rank(int value, int center) {
 typedef int32_t qoamax_vi32 __attribute__((vector_size(QOAMAX_LANES * 4)));
 typedef uint32_t qoamax_vu32 __attribute__((vector_size(QOAMAX_LANES * 4)));
 
-//! Hill-climb results of all 16 scalefactors (indexed by scalefactor) after encoding the same samples.
+//! Hill-climb results of all 16 scalefactors after encoding the same samples. They are indexed by position
+//! (scalefactor - base) & 15 in the search's rotated order, so that every lane window is a contiguous block.
 typedef struct {
   int32_t history[4][16];
   int32_t weights[4][16];
@@ -416,30 +419,33 @@ typedef struct {
 } qoamax_scalefactor_results;
 
 //! Runs @ref qoamax_encode_hillclimb_search (or its unclamped variant) for the QOAMAX_LANES scalefactors starting at
-//! `first`, one per lane. Stops early once every lane's error reaches `bound`; the lanes' errors are UINT64_MAX then
-//! and their other results are unspecified.
+//! table column `column` (scalefactor column & 15), one per lane, and stores the results from position `pos` on.
+//! Stops early once every lane's error reaches `bound`, returning false (the results are unspecified then).
 [[gnu::always_inline]]
-static inline void qoamax_hillclimb_lanes_impl(const qoamax_lms *lms, int samples_count,
-                                               const int16_t samples[static restrict samples_count], int first,
-                                               uint64_t bound, qoamax_scalefactor_results *restrict out,
+static inline bool qoamax_hillclimb_lanes_impl(const qoamax_lms *lms, int samples_count,
+                                               const int16_t samples[static restrict samples_count], int column,
+                                               int pos, uint64_t bound, qoamax_scalefactor_results *restrict out,
                                                bool unclamped) {
   qoamax_assume(samples_count >= 1 && samples_count <= 20);
 
   qoamax_vi32 q0, q1, q2, d0, d1, d2, d3;
-  memcpy(&q0, &qoamax_lanes_qt[0][first], sizeof q0);
-  memcpy(&q1, &qoamax_lanes_qt[1][first], sizeof q1);
-  memcpy(&q2, &qoamax_lanes_qt[2][first], sizeof q2);
-  memcpy(&d0, &qoamax_lanes_dqt[0][first], sizeof d0);
-  memcpy(&d1, &qoamax_lanes_dqt[1][first], sizeof d1);
-  memcpy(&d2, &qoamax_lanes_dqt[2][first], sizeof d2);
-  memcpy(&d3, &qoamax_lanes_dqt[3][first], sizeof d3);
+  memcpy(&q0, &qoamax_lanes_qt[0][column], sizeof q0);
+  memcpy(&q1, &qoamax_lanes_qt[1][column], sizeof q1);
+  memcpy(&q2, &qoamax_lanes_qt[2][column], sizeof q2);
+  memcpy(&d0, &qoamax_lanes_dqt[0][column], sizeof d0);
+  memcpy(&d1, &qoamax_lanes_dqt[1][column], sizeof d1);
+  memcpy(&d2, &qoamax_lanes_dqt[2][column], sizeof d2);
+  memcpy(&d3, &qoamax_lanes_dqt[3][column], sizeof d3);
 
   const qoamax_vi32 zero = {};
   qoamax_vi32 h0 = zero + lms->history[0], h1 = zero + lms->history[1];
   qoamax_vi32 h2 = zero + lms->history[2], h3 = zero + lms->history[3];
   qoamax_vi32 w0 = zero + lms->weights[0], w1 = zero + lms->weights[1];
   qoamax_vi32 w2 = zero + lms->weights[2], w3 = zero + lms->weights[3];
-  qoamax_vu32 error_low = {}, error_high = {}; // 64-bit errors, split into two halves
+  // 64-bit errors, split into two halves. Both are biased by 2^31 (stored as value ^ INT32_MIN), so that signed
+  // comparisons give their unsigned order: x86 has no unsigned vector comparisons before AVX-512.
+  const uint32_t bias   = 0x80000000;
+  qoamax_vu32 error_low = (qoamax_vu32){} + bias, error_high = error_low;
 
   QOAMAX_UNROLL_SLICE
   for (int i = 0; i < samples_count; i++) {
@@ -454,10 +460,10 @@ static inline void qoamax_hillclimb_lanes_impl(const qoamax_lms *lms, int sample
     qoamax_vi32 abs       = (residual ^ (residual >> 31)) - (residual >> 31);
     qoamax_vi32 above0 = abs > q0, above1 = abs > q1, above2 = abs > q2; // nested: above2 implies above1 implies above0
 
-    qoamax_vi32 magnitude   = d0 + (above0 & (d1 - d0)) + (above1 & (d2 - d1)) + (above2 & (d3 - d2));
+    qoamax_vi32 magnitude   = d0 + (above0 & d1) + (above1 & d2) + (above2 & d3);
     qoamax_vi32 dequantized = (magnitude ^ negative) - negative;
     qoamax_vi32 quant       = (-(above0 + above1 + above2) << 1) | (negative & 1);
-    memcpy(&out->quant[i][first], &quant, sizeof quant);
+    memcpy(&out->quant[i][pos], &quant, sizeof quant);
 
     qoamax_vi32 reconstructed  = predicted + dequantized;
     qoamax_vi32 unclamped_diff = sample - reconstructed;
@@ -473,16 +479,16 @@ static inline void qoamax_hillclimb_lanes_impl(const qoamax_lms *lms, int sample
       qoamax_vu32 low = diff & 0xFFFF, high = diff >> 16;
       qoamax_vu32 cross     = 2 * high * low; // < 2^20
       qoamax_vu32 new_error = error_low + low * low;
-      error_high -= (qoamax_vu32)(new_error < error_low);
+      error_high -= (qoamax_vu32)((qoamax_vi32)new_error < (qoamax_vi32)error_low);
       error_low = new_error;
       new_error = error_low + (cross << 16);
-      error_high -= (qoamax_vu32)(new_error < error_low);
+      error_high -= (qoamax_vu32)((qoamax_vi32)new_error < (qoamax_vi32)error_low);
       error_low = new_error;
       error_high += (cross >> 16) + high * high;
     } else {
       qoamax_vi32 diff      = sample - reconstructed;
       qoamax_vu32 new_error = error_low + (qoamax_vu32)diff * (qoamax_vu32)diff;
-      error_high -= (qoamax_vu32)(new_error < error_low); // carry (the comparison yields -1)
+      error_high -= (qoamax_vu32)((qoamax_vi32)new_error < (qoamax_vi32)error_low); // carry (the comparison yields -1)
       error_low = new_error;
     }
 
@@ -494,44 +500,45 @@ static inline void qoamax_hillclimb_lanes_impl(const qoamax_lms *lms, int sample
     w3 += (delta ^ sign3) - sign3;
     h0 = h1, h1 = h2, h2 = h3, h3 = reconstructed;
 
-    if (i % 2 == 1 && i + 1 < samples_count) {
-      uint32_t bound_high = bound >> 32, bound_low = bound;
-      qoamax_vi32 alive = (error_high < bound_high) | ((error_high == bound_high) & (error_low < bound_low));
+    // Many windows are dead after a few samples, later ones rarely die: check after the first four samples, then after
+    // every second one.
+    if ((i < 4 || i % 2 == 1) && i + 1 < samples_count) {
+      int32_t bound_high = (uint32_t)(bound >> 32) ^ bias, bound_low = (uint32_t)bound ^ bias;
+      qoamax_vi32 high = (qoamax_vi32)error_high, low = (qoamax_vi32)error_low;
+      qoamax_vi32 alive = (high < bound_high) | ((high == bound_high) & (low < bound_low));
       bool any_alive    = false;
       for (int lane = 0; lane < QOAMAX_LANES; lane++) any_alive |= alive[lane] != 0;
-      if (!any_alive) {
-        for (int lane = 0; lane < QOAMAX_LANES; lane++) out->errors[first + lane] = UINT64_MAX;
-        return;
-      }
+      if (!any_alive) return false;
     }
   }
 
   for (int lane = 0; lane < QOAMAX_LANES; lane++)
-    out->errors[first + lane] = (uint64_t)error_high[lane] << 32 | error_low[lane];
-  memcpy(&out->history[0][first], &h0, sizeof h0);
-  memcpy(&out->history[1][first], &h1, sizeof h1);
-  memcpy(&out->history[2][first], &h2, sizeof h2);
-  memcpy(&out->history[3][first], &h3, sizeof h3);
-  memcpy(&out->weights[0][first], &w0, sizeof w0);
-  memcpy(&out->weights[1][first], &w1, sizeof w1);
-  memcpy(&out->weights[2][first], &w2, sizeof w2);
-  memcpy(&out->weights[3][first], &w3, sizeof w3);
+    out->errors[pos + lane] = (uint64_t)(error_high[lane] ^ bias) << 32 | (error_low[lane] ^ bias);
+  memcpy(&out->history[0][pos], &h0, sizeof h0);
+  memcpy(&out->history[1][pos], &h1, sizeof h1);
+  memcpy(&out->history[2][pos], &h2, sizeof h2);
+  memcpy(&out->history[3][pos], &h3, sizeof h3);
+  memcpy(&out->weights[0][pos], &w0, sizeof w0);
+  memcpy(&out->weights[1][pos], &w1, sizeof w1);
+  memcpy(&out->weights[2][pos], &w2, sizeof w2);
+  memcpy(&out->weights[3][pos], &w3, sizeof w3);
+  return true;
 }
 
 //! See @ref qoamax_hillclimb_lanes_impl. The common 20-sample case gets its own fully unrolled copy.
-static void qoamax_hillclimb_lanes(const qoamax_lms *lms, int samples_count,
-                                   const int16_t samples[static restrict samples_count], int first, uint64_t bound,
-                                   qoamax_scalefactor_results *restrict out) {
-  if (samples_count == 20) return qoamax_hillclimb_lanes_impl(lms, 20, samples, first, bound, out, false);
-  return qoamax_hillclimb_lanes_impl(lms, samples_count, samples, first, bound, out, false);
+static bool qoamax_hillclimb_lanes(const qoamax_lms *lms, int samples_count,
+                                   const int16_t samples[static restrict samples_count], int column, int pos,
+                                   uint64_t bound, qoamax_scalefactor_results *restrict out) {
+  if (samples_count == 20) return qoamax_hillclimb_lanes_impl(lms, 20, samples, column, pos, bound, out, false);
+  return qoamax_hillclimb_lanes_impl(lms, samples_count, samples, column, pos, bound, out, false);
 }
 
 //! See @ref qoamax_hillclimb_lanes_impl (unclamped variant).
-static void qoamax_hillclimb_lanes_unclamped(const qoamax_lms *lms, int samples_count,
-                                             const int16_t samples[static restrict samples_count], int first,
+static bool qoamax_hillclimb_lanes_unclamped(const qoamax_lms *lms, int samples_count,
+                                             const int16_t samples[static restrict samples_count], int column, int pos,
                                              uint64_t bound, qoamax_scalefactor_results *restrict out) {
-  if (samples_count == 20) return qoamax_hillclimb_lanes_impl(lms, 20, samples, first, bound, out, true);
-  return qoamax_hillclimb_lanes_impl(lms, samples_count, samples, first, bound, out, true);
+  if (samples_count == 20) return qoamax_hillclimb_lanes_impl(lms, 20, samples, column, pos, bound, out, true);
+  return qoamax_hillclimb_lanes_impl(lms, samples_count, samples, column, pos, bound, out, true);
 }
 
 static uint64_t
@@ -543,6 +550,7 @@ static uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclampe
     uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error);
 
 //! SIMD version of @ref qoamax_encode_slice__hillclimb_scalefactor_search_scalar_impl with identical results.
+//! out_slice may be null when only the returned error is needed (out_error and lms are left unchanged then).
 [[gnu::always_inline]]
 static inline uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_lanes_impl(
     qoamax_lms *lms, int first_scalefactor, int lookahead, const int16_t samples[static restrict lookahead],
@@ -550,74 +558,81 @@ static inline uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_lanes_i
   int samples_count = QOAMAX_MIN(20, lookahead);
   qoamax_scalefactor_results results;
 
-  int rank[16];
-  for (int sf = 0; sf < 16; sf++) rank[sf] = qoamax_outward_rank(sf, first_scalefactor);
+  // The lane windows are rotated so that the first one holds the scalefactors around first_scalefactor, which
+  // usually include the best one. The other windows then hold only distant scalefactors, which exit early.
+  // Results are indexed by position (scalefactor - base) & 15, window w holds positions w * QOAMAX_LANES and up.
+  int base = QOAMAX_MIN(QOAMAX_MAX(first_scalefactor - (QOAMAX_LANES / 2 - 1), 0), 16 - QOAMAX_LANES);
+  int rank[16]; // by position
+  for (int pos = 0; pos < 16; pos++) rank[pos] = qoamax_outward_rank((base + pos) & 15, first_scalefactor);
 
-  int best            = -1;
+  int best            = -1; // position
   uint64_t best_error = error_hint;
-  int first_group     = first_scalefactor / QOAMAX_LANES;
 
-  // Visit the lane groups outwards from the previous scalefactor.
-  // Once a candidate is found, its error bounds the remaining groups.
-  for (int i = 0, visited = 0; visited < QOAMAX_GROUPS; i++) {
-    int group = qoamax_outward(first_group, i);
-    if ((unsigned)group >= QOAMAX_GROUPS) continue;
-    visited++;
+  // Visit the windows outwards from the first one, as if they continued past both ends of the scalefactor range. A
+  // window that wraps around is visited at the first of its two parts.
+  unsigned visited = 0;
+  for (int i = 0; visited != (1u << QOAMAX_GROUPS) - 1; i++) {
+    int offset = qoamax_outward(0, i) * QOAMAX_LANES;
+    if (base + offset + QOAMAX_LANES <= 0 || base + offset >= 16) continue;
+    int window = (offset / QOAMAX_LANES) & (QOAMAX_GROUPS - 1);
+    if (visited & (1u << window)) continue;
+    visited |= 1u << window;
 
-    int first = group * QOAMAX_LANES;
+    int first = window * QOAMAX_LANES;
 
     // Lanes can only win with a lower error, or with an equal error and a better rank than the current best.
     bool may_win_tie = false;
-    for (int sf = first; sf < first + QOAMAX_LANES; sf++) may_win_tie |= best >= 0 && rank[sf] < rank[best];
+    for (int pos = first; pos < first + QOAMAX_LANES; pos++) may_win_tie |= best >= 0 && rank[pos] < rank[best];
     uint64_t bound = best < 0 ? error_hint : best_error + may_win_tie;
-    if (unclamped)
-      qoamax_hillclimb_lanes_unclamped(lms, samples_count, samples, first, bound, &results);
-    else
-      qoamax_hillclimb_lanes(lms, samples_count, samples, first, bound, &results);
+    bool any_alive =
+        unclamped ? qoamax_hillclimb_lanes_unclamped(lms, samples_count, samples, base + first, first, bound, &results)
+                  : qoamax_hillclimb_lanes(lms, samples_count, samples, base + first, first, bound, &results);
+    if (!any_alive) continue;
 
-    // Visit the group's candidates by increasing error of their first slice (ties by rank), so the loop can stop
+    // Visit the window's candidates by increasing error of their first slice (ties by rank), so the loop can stop
     // as soon as that error alone is too large.
     int order[QOAMAX_LANES];
     for (int j = 0; j < QOAMAX_LANES; j++) {
-      int sf = first + j, k = j;
+      int pos = first + j, k = j;
       for (; k > 0; k--) {
         int other = order[k - 1];
-        if (results.errors[other] < results.errors[sf]) break;
-        if (results.errors[other] == results.errors[sf] && rank[other] < rank[sf]) break;
+        if (results.errors[other] < results.errors[pos]) break;
+        if (results.errors[other] == results.errors[pos] && rank[other] < rank[pos]) break;
         order[k] = other;
       }
-      order[k] = sf;
+      order[k] = pos;
     }
 
     for (int j = 0; j < QOAMAX_LANES; j++) {
-      int sf         = order[j];
-      uint64_t error = results.errors[sf];
-      bool wins_tie  = best >= 0 && rank[sf] < rank[best];
+      int pos        = order[j];
+      uint64_t error = results.errors[pos];
+      bool wins_tie  = best >= 0 && rank[pos] < rank[best];
       if (error > best_error) break;
       if (error == best_error && !wins_tie) continue;
 
       if (lookahead > 20) {
         qoamax_lms next_lms;
         for (int k = 0; k < 4; k++)
-          next_lms.history[k] = results.history[k][sf], next_lms.weights[k] = results.weights[k][sf];
+          next_lms.history[k] = results.history[k][pos], next_lms.weights[k] = results.weights[k][pos];
 
-        uint64_t next_hint = best_error - error + wins_tie, next_slice, next_first_error;
-        uint64_t next_error =
-            unclamped ? qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped(
-                            &next_lms, sf, lookahead - 20, &samples[20], next_hint, &next_slice, &next_first_error)
-                      : qoamax_encode_slice__hillclimb_scalefactor_search_lanes(
-                            &next_lms, sf, lookahead - 20, &samples[20], next_hint, &next_slice, &next_first_error);
+        int sf              = (base + pos) & 15;
+        uint64_t next_hint  = best_error - error + wins_tie;
+        uint64_t next_error = unclamped ? qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped(
+                                              &next_lms, sf, lookahead - 20, &samples[20], next_hint, nullptr, nullptr)
+                                        : qoamax_encode_slice__hillclimb_scalefactor_search_lanes(
+                                              &next_lms, sf, lookahead - 20, &samples[20], next_hint, nullptr, nullptr);
         if (next_error >= next_hint) continue;
         error += next_error;
       }
 
-      if (error < best_error || (error == best_error && wins_tie)) best = sf, best_error = error;
+      if (error < best_error || (error == best_error && wins_tie)) best = pos, best_error = error;
     }
   }
 
   if (best < 0) return error_hint;
+  if (!out_slice) return best_error; // only the error is needed (lookahead)
 
-  uint64_t slice = best;
+  uint64_t slice = (base + best) & 15;
   for (int i = 0; i < samples_count; i++) slice = (slice << 3) | results.quant[i][best];
   *out_slice = slice << ((20 - samples_count) * 3);
   *out_error = results.errors[best];

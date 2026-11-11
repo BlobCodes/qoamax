@@ -651,11 +651,123 @@ static inline void qoamax_beam_insert(qoamax_beam_slots slots, int *used, int wi
   slots.codepoint[slot] = codepoint;
 }
 
+//! The errors of the candidates of a beam search step for small beams (up to 4), by slot. Once inlined, they are kept
+//! in registers. Free slots hold the bound (`error_hint`), so they are taken first and in order, and the used slots
+//! always come first.
+typedef struct {
+  uint64_t error[4];
+  uint64_t max_error; //!< The highest error of all slots: candidates need a lower error to enter the beam
+  int worst;          //!< The first slot holding max_error, which the next candidate replaces
+} qoamax_beam_small;
+
+//! Adds a candidate (with an error below max_error) to a small beam, replacing the worst one.
+//! @param candidates By slot: index of the source node << 3 | codepoint. (A separate array, because it is indexed by
+//!                   slot, which would keep the errors in memory.)
+[[gnu::always_inline]]
+static inline void qoamax_beam_small_insert(qoamax_beam_small *beam, uint16_t *candidates, int width, uint64_t error,
+                                            int parent, int codepoint) {
+  // Conditional moves instead of indexing error[worst], so that the errors stay in registers.
+  for (int k = 0; k < width; k++) beam->error[k] = k == beam->worst ? error : beam->error[k];
+  candidates[beam->worst] = (uint16_t)(parent << 3 | codepoint);
+
+  beam->max_error = beam->error[0], beam->worst = 0;
+  for (int k = 1; k < width; k++)
+    if (beam->error[k] > beam->max_error) beam->max_error = beam->error[k], beam->worst = k;
+}
+
+//! See @ref qoamax_encode_beam_search_impl, for beams of width 1 to 4. Instead of a heap, the candidates are kept by
+//! slot (see @ref qoamax_beam_small). That is faster (FAST 8-13%, MEDIUM and SLOW 13-17%), but keeps a different one
+//! of several candidates with the same error, so its results differ slightly (not worse on average).
+[[gnu::always_inline]]
+static inline int qoamax_encode_beam_search_small(const qoamax_beam_node *restrict src, int src_count,
+                                                  qoamax_beam_node *restrict buffers, int width, bool first_slice,
+                                                  int samples_size, const int16_t samples[static restrict samples_size],
+                                                  int scalefactor, uint64_t error_hint,
+                                                  qoamax_beam_node *restrict *restrict out, int32_t *restrict predicted,
+                                                  bool branchless) {
+  qoamax_assume(width > 0 && width <= 4);
+
+  const int16_t *restrict dqt     = qoamax_dqt[scalefactor];
+  const qoamax_decoder_entry *row = qoamax_decoder_table[scalefactor];
+  qoamax_beam_small beam;
+  uint16_t slot_candidates[4];
+
+  for (int i = 0; i < samples_size; i++) {
+    int32_t actual_sample = samples[i];
+    for (int k = 0; k < width; k++) beam.error[k] = error_hint;
+    beam.max_error = error_hint, beam.worst = 0;
+
+    for (int j = 0; j < src_count; j++) {
+      uint64_t current_error = src[j].error;
+      qoamax_lms_regs regs   = qoamax_lms_load(&src[j].lms);
+      int32_t prediction     = qoamax_lms_predict(&regs);
+      predicted[j]           = prediction;
+
+      if (width <= 2 && !branchless) {
+        // With tiny beams, most candidates pass the bound, so checking them all upfront doesn't pay off.
+        for (int codepoint = 0; codepoint < 8; codepoint++) {
+          uint64_t error     = qoamax_error_squared_unclamped(actual_sample, prediction + dqt[codepoint]);
+          uint64_t new_error = qoamax_add_saturating(current_error, error);
+          if (new_error < beam.max_error)
+            qoamax_beam_small_insert(&beam, slot_candidates, width, new_error, j, codepoint);
+        }
+      } else {
+        // Compute all candidates without branches, then insert the ones below the bound (in codepoint order).
+        uint64_t new_errors[8];
+        unsigned candidates = 0;
+        for (int codepoint = 0; codepoint < 8; codepoint++) {
+          uint64_t error        = qoamax_error_squared_unclamped(actual_sample, prediction + dqt[codepoint]);
+          new_errors[codepoint] = qoamax_add_saturating(current_error, error);
+          candidates |= (unsigned)(new_errors[codepoint] < beam.max_error) << codepoint;
+        }
+
+        for (; candidates; candidates &= candidates - 1) {
+          int codepoint      = __builtin_ctz(candidates);
+          uint64_t new_error = new_errors[codepoint];
+          // the bound may have decreased in the meantime
+          if (new_error < beam.max_error)
+            qoamax_beam_small_insert(&beam, slot_candidates, width, new_error, j, codepoint);
+        }
+      }
+    }
+
+    // Construct the surviving nodes (the used slots)
+    qoamax_beam_node *dst = &buffers[(i & 1) * width];
+    int used              = 0;
+    for (int slot = 0; slot < width && beam.error[slot] < error_hint; slot++, used++) {
+      int parent_index                  = slot_candidates[slot] >> 3;
+      int codepoint                     = slot_candidates[slot] & 7;
+      const qoamax_beam_node *parent    = &src[parent_index];
+      const qoamax_decoder_entry *entry = &row[codepoint];
+
+      qoamax_lms_regs regs = qoamax_lms_load(&parent->lms);
+      qoamax_lms_update(&regs, entry, qoamax_clamp_s16(predicted[parent_index] + entry->dequantized));
+      qoamax_lms_store(&dst[slot].lms, &regs);
+      dst[slot].error = beam.error[slot];
+
+      if (!first_slice)
+        dst[slot].slice = parent->slice;
+      else if (i == 0)
+        dst[slot].slice = ((uint64_t)scalefactor << 3) | codepoint;
+      else
+        dst[slot].slice = (parent->slice << 3) | codepoint;
+    }
+    if (used == 0) return 0;
+
+    src       = dst;
+    src_count = used;
+  }
+
+  *out = (qoamax_beam_node *)src;
+  return src_count;
+}
+
 //! Runs a beam search with the given scalefactor over the samples, starting from the `src` nodes (not modified).
 //! The error is computed before clamping the reconstructed sample to 16 bits.
 //!
 //! Every step keeps the `width` best candidates (8 codepoints per node). Candidates are first collected in a max-heap
-//! of slots, and the surviving nodes are only constructed once the step is complete.
+//! of slots (beams up to width 4: see @ref qoamax_encode_beam_search_small), and the surviving nodes are only
+//! constructed once the step is complete.
 //!
 //! @param buffers   Room for 2 * width nodes, alternately used by the steps.
 //! @param slots     Room for `width` candidates.
@@ -674,6 +786,10 @@ static inline int qoamax_encode_beam_search_impl(const qoamax_beam_node *restric
   qoamax_assume(width > 0 && width <= QOAMAX_MAX_BEAM_WIDTH);
   qoamax_assume(scalefactor >= 0 && scalefactor <= 15);
 
+  if (width <= 4)
+    return qoamax_encode_beam_search_small(src, src_count, buffers, width, first_slice, samples_size, samples,
+                                           scalefactor, error_hint, out, predicted, branchless);
+
   const int16_t *restrict dqt     = qoamax_dqt[scalefactor];
   const qoamax_decoder_entry *row = qoamax_decoder_table[scalefactor];
 
@@ -688,34 +804,22 @@ static inline int qoamax_encode_beam_search_impl(const qoamax_beam_node *restric
       int32_t prediction     = qoamax_lms_predict(&regs);
       predicted[j]           = prediction;
 
-      if (width <= 2 && !branchless) {
-        // With tiny beams, most candidates pass the bound, so checking them all upfront doesn't pay off.
-        for (int codepoint = 0; codepoint < 8; codepoint++) {
-          uint64_t error     = qoamax_error_squared_unclamped(actual_sample, prediction + dqt[codepoint]);
-          uint64_t new_error = qoamax_add_saturating(current_error, error);
-          if (new_error >= max_error) continue;
+      // Compute all candidates without branches, then insert the ones below the bound (in codepoint order).
+      uint64_t new_errors[8];
+      unsigned candidates = 0;
+      for (int codepoint = 0; codepoint < 8; codepoint++) {
+        uint64_t error        = qoamax_error_squared_unclamped(actual_sample, prediction + dqt[codepoint]);
+        new_errors[codepoint] = qoamax_add_saturating(current_error, error);
+        candidates |= (unsigned)(new_errors[codepoint] < max_error) << codepoint;
+      }
 
-          qoamax_beam_insert(slots, &used, width, new_error, j, codepoint);
-          if (used == width) max_error = QOAMAX_MIN(max_error, slots.heap[0].error);
-        }
-      } else {
-        // Compute all candidates without branches, then insert the ones below the bound (in codepoint order).
-        uint64_t new_errors[8];
-        unsigned candidates = 0;
-        for (int codepoint = 0; codepoint < 8; codepoint++) {
-          uint64_t error        = qoamax_error_squared_unclamped(actual_sample, prediction + dqt[codepoint]);
-          new_errors[codepoint] = qoamax_add_saturating(current_error, error);
-          candidates |= (unsigned)(new_errors[codepoint] < max_error) << codepoint;
-        }
+      for (; candidates; candidates &= candidates - 1) {
+        int codepoint      = __builtin_ctz(candidates);
+        uint64_t new_error = new_errors[codepoint];
+        if (new_error >= max_error) continue; // the bound may have decreased in the meantime
 
-        for (; candidates; candidates &= candidates - 1) {
-          int codepoint      = __builtin_ctz(candidates);
-          uint64_t new_error = new_errors[codepoint];
-          if (new_error >= max_error) continue; // the bound may have decreased in the meantime
-
-          qoamax_beam_insert(slots, &used, width, new_error, j, codepoint);
-          if (used == width) max_error = QOAMAX_MIN(max_error, slots.heap[0].error);
-        }
+        qoamax_beam_insert(slots, &used, width, new_error, j, codepoint);
+        if (used == width) max_error = QOAMAX_MIN(max_error, slots.heap[0].error);
       }
     }
 

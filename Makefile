@@ -12,7 +12,7 @@ TEST_CFLAGS := $(CFLAGS) -O1 -g -Wall -Wextra -pthread \
                -fstack-protector-strong
 # The library tests also run with these SIMD lane counts (besides the target's default), which must all produce the
 # same output. Lane counts above the target's vector width work too, the compiler splits the vectors.
-TEST_LANES := 1 2 8 16
+TEST_LANES := 1 2 4 8 16
 TEST_LIBS := $(BUILD_DIR)/test_lib $(foreach lanes,$(TEST_LANES),$(BUILD_DIR)/test_lib_lanes$(lanes))
 
 .PHONY: all debug release test clean

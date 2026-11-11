@@ -1,6 +1,6 @@
-// Library tests, run by `make test`. They are built with ASan and UBSan, and for several values of QOAMAX_LANES (which
-// must all produce identical output). All buffers passed to the library are allocated with their exact size, so that
-// ASan catches reads or writes out of bounds.
+// Library tests, run by `make test`. They are built with ASan and UBSan, with the default SIMD variants (chosen at
+// runtime) and for several fixed values of QOAMAX_LANES, which must all produce identical output. All buffers passed to
+// the library are allocated with their exact size, so that ASan catches reads or writes out of bounds.
 //
 // Usage: test_lib [--print-checksums]
 //   --print-checksums  Prints the checksums of the encoder efforts' output, to update `effort_cases` after an
@@ -583,7 +583,11 @@ int main(int argc, char **argv) {
       {"stack usage", test_stack_usage},
   };
 
+#ifdef QOAMAX_HAS_VARIANTS
+  printf("test_lib (QOAMAX_LANES=%d, runtime dispatch to %d):\n", QOAMAX_LANES, qoamax__lanes_supported());
+#else
   printf("test_lib (QOAMAX_LANES=%d):\n", QOAMAX_LANES);
+#endif
   int before = failures;
   test_efforts(false);
   printf("  %-28s %s\n", "encoder efforts", failures == before ? "ok" : "FAILED");

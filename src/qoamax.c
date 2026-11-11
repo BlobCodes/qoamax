@@ -409,6 +409,7 @@ static_assert(QOAMAX_LANES >= 1 && QOAMAX_LANES <= 16 && 16 % QOAMAX_LANES == 0)
 #if QOAMAX_DISPATCH && (defined(__x86_64__) || defined(__i386__))
 #if QOAMAX_LANES < 8
 #define QOAMAX_TARGET_X8 "avx2"
+#define QOAMAX_TARGET_BEAM "avx2" // the beam search's variant, chosen if qoamax__lanes_supported() >= 8
 #endif
 #if QOAMAX_LANES < 16
 #define QOAMAX_TARGET_X16 "avx512f"
@@ -439,6 +440,11 @@ static int qoamax__lanes_supported(void) {
 #if defined(QOAMAX_TARGET_X4) || defined(QOAMAX_TARGET_X8) || defined(QOAMAX_TARGET_X16)
 #define QOAMAX_HAS_VARIANTS
 #endif
+
+// Pastes QOAMAX_VARIANT_SUFFIX to a name defined in qoamax_lanes.h or qoamax_beam.h.
+#define QOAMAX_VARIANT_NAME(name) QOAMAX_VARIANT_NAME_(name, QOAMAX_VARIANT_SUFFIX)
+#define QOAMAX_VARIANT_NAME_(name, suffix) QOAMAX_VARIANT_NAME__(name, suffix)
+#define QOAMAX_VARIANT_NAME__(name, suffix) name##suffix
 
 #if QOAMAX_LANES > 1 || defined(QOAMAX_HAS_VARIANTS)
 
@@ -486,11 +492,6 @@ static inline uint64_t qoamax_scalefactor_results_get(const qoamax_scalefactor_r
   for (int k = 0; k < 4; k++) lms->history[k] = results->history[k][pos], lms->weights[k] = results->weights[k][pos];
   return slice << ((20 - samples_count) * 3);
 }
-
-// Pastes QOAMAX_VARIANT_SUFFIX to a name defined in qoamax_lanes.h.
-#define QOAMAX_VARIANT_NAME(name) QOAMAX_VARIANT_NAME_(name, QOAMAX_VARIANT_SUFFIX)
-#define QOAMAX_VARIANT_NAME_(name, suffix) QOAMAX_VARIANT_NAME__(name, suffix)
-#define QOAMAX_VARIANT_NAME__(name, suffix) name##suffix
 
 #if QOAMAX_LANES > 1
 #define QOAMAX_VARIANT_LANES QOAMAX_LANES
@@ -659,6 +660,8 @@ static inline void qoamax_beam_insert(qoamax_beam_slots slots, int *used, int wi
 //! @param buffers   Room for 2 * width nodes, alternately used by the steps.
 //! @param slots     Room for `width` candidates.
 //! @param predicted Room for `width` predictions.
+//! @param branchless Whether beams of width 1 and 2 also compute all candidates first. That only pays off where the
+//!                   compiler vectorizes it well (64-bit multiplies and comparisons: AVX2).
 //! @returns the number of resulting nodes, which are stored in buffers (*out).
 [[gnu::always_inline]]
 static inline int qoamax_encode_beam_search_impl(const qoamax_beam_node *restrict src, int src_count,
@@ -666,7 +669,7 @@ static inline int qoamax_encode_beam_search_impl(const qoamax_beam_node *restric
                                                  int samples_size, const int16_t samples[static restrict samples_size],
                                                  int scalefactor, uint64_t error_hint,
                                                  qoamax_beam_node *restrict *restrict out, qoamax_beam_slots slots,
-                                                 int32_t *restrict predicted) {
+                                                 int32_t *restrict predicted, bool branchless) {
   qoamax_assume(samples_size >= 1 && samples_size <= 20);
   qoamax_assume(width > 0 && width <= QOAMAX_MAX_BEAM_WIDTH);
   qoamax_assume(scalefactor >= 0 && scalefactor <= 15);
@@ -685,7 +688,7 @@ static inline int qoamax_encode_beam_search_impl(const qoamax_beam_node *restric
       int32_t prediction     = qoamax_lms_predict(&regs);
       predicted[j]           = prediction;
 
-      if (width <= 2) {
+      if (width <= 2 && !branchless) {
         // With tiny beams, most candidates pass the bound, so checking them all upfront doesn't pay off.
         for (int codepoint = 0; codepoint < 8; codepoint++) {
           uint64_t error     = qoamax_error_squared_unclamped(actual_sample, prediction + dqt[codepoint]);
@@ -746,88 +749,23 @@ static inline int qoamax_encode_beam_search_impl(const qoamax_beam_node *restric
   return src_count;
 }
 
-//! See @ref qoamax_encode_beam_search_impl. Wide beams (and unusual widths) get their own function, so that their
-//! large search state is only on the stack when it is used.
-[[gnu::noinline]]
-static int qoamax_encode_beam_search__wide(const qoamax_beam_node *restrict src, int src_count,
-                                           qoamax_beam_node *restrict buffers, int width, bool first_slice,
-                                           int samples_size, const int16_t samples[static restrict samples_size],
-                                           int scalefactor, uint64_t error_hint,
-                                           qoamax_beam_node *restrict *restrict out) {
-  qoamax_beam_heap_entry heap[QOAMAX_MAX_BEAM_WIDTH];
-  uint64_t error[QOAMAX_MAX_BEAM_WIDTH];
-  uint16_t parent[QOAMAX_MAX_BEAM_WIDTH];
-  uint8_t codepoint[QOAMAX_MAX_BEAM_WIDTH];
-  int32_t predicted[QOAMAX_MAX_BEAM_WIDTH];
-  qoamax_beam_slots slots = {heap, error, parent, codepoint};
-  return qoamax_encode_beam_search_impl(src, src_count, buffers, width, first_slice, samples_size, samples, scalefactor,
-                                        error_hint, out, slots, predicted);
-}
+// The functions of the beam search, compiled for the compile target and, on x86 without AVX2, also for AVX2 (see
+// qoamax_beam.h). The AVX2 variant makes FAST 7% faster and MEDIUM to VERYSLOW 9-10%.
+#define QOAMAX_VARIANT_SUFFIX
+#define QOAMAX_VARIANT_TARGET
+#ifdef __AVX2__
+#define QOAMAX_BEAM_BRANCHLESS true
+#else
+#define QOAMAX_BEAM_BRANCHLESS false
+#endif
+#include "./qoamax_beam.h"
 
-//! See @ref qoamax_encode_beam_search_impl. The small beam widths used by the encoder efforts (2, 4 and
-//! QOAMAX_SMALL_BEAM_WIDTH) get their own copies. The caller chooses between this and the wide variant, which keeps
-//! this function free of calls (otherwise gcc's code gets about 3% slower).
-static int qoamax_encode_beam_search(const qoamax_beam_node *restrict src, int src_count,
-                                     qoamax_beam_node *restrict buffers, int width, bool first_slice, int samples_size,
-                                     const int16_t samples[static restrict samples_size], int scalefactor,
-                                     uint64_t error_hint, qoamax_beam_node *restrict *restrict out) {
-  qoamax_beam_heap_entry heap[QOAMAX_SMALL_BEAM_WIDTH];
-  uint64_t error[QOAMAX_SMALL_BEAM_WIDTH];
-  uint16_t parent[QOAMAX_SMALL_BEAM_WIDTH];
-  uint8_t codepoint[QOAMAX_SMALL_BEAM_WIDTH];
-  int32_t predicted[QOAMAX_SMALL_BEAM_WIDTH];
-  qoamax_beam_slots slots = {heap, error, parent, codepoint};
-  switch (width) {
-  case 2:
-    return qoamax_encode_beam_search_impl(src, src_count, buffers, 2, first_slice, samples_size, samples, scalefactor,
-                                          error_hint, out, slots, predicted);
-  case 4:
-    return qoamax_encode_beam_search_impl(src, src_count, buffers, 4, first_slice, samples_size, samples, scalefactor,
-                                          error_hint, out, slots, predicted);
-  default:
-    return qoamax_encode_beam_search_impl(src, src_count, buffers, QOAMAX_SMALL_BEAM_WIDTH, first_slice, samples_size,
-                                          samples, scalefactor, error_hint, out, slots, predicted);
-  }
-}
-
-//! Searches the best scalefactor using a beam search for each one, recursively continuing the search for the
-//! following slices of the lookahead from the resulting nodes. Only results better than error_hint are considered.
-//! `buffers` holds 2 * beam_width nodes per slice of the lookahead, the depth-th slice uses the depth-th part.
-static void qoamax_encode_slice__beam_scalefactor_search(const qoamax_beam_node *src, int src_count,
-                                                         qoamax_beam_node *buffers, int beam_width, int depth,
-                                                         int first_scalefactor, int lookahead,
-                                                         const int16_t samples[static restrict lookahead],
-                                                         uint64_t error_hint, qoamax_beam_node *out_node) {
-  for (int rank = 0; rank < 31; rank++) {
-    int scalefactor = qoamax_outward(first_scalefactor, rank);
-    if ((unsigned)scalefactor >= 16) continue;
-
-    qoamax_beam_node *nodes;
-    bool small      = beam_width == 2 || beam_width == 4 || beam_width == QOAMAX_SMALL_BEAM_WIDTH;
-    int nodes_count = (small ? qoamax_encode_beam_search : qoamax_encode_beam_search__wide)(
-        src, src_count, &buffers[depth * 2 * beam_width], beam_width, depth == 0, QOAMAX_MIN(20, lookahead), samples,
-        scalefactor, error_hint, &nodes);
-    if (nodes_count == 0) continue;
-
-    const qoamax_beam_node *best = &nodes[0];
-    for (int i = 1; i < nodes_count; i++)
-      if (nodes[i].error < best->error) best = &nodes[i];
-    if (best->error >= error_hint) continue;
-
-    if (lookahead <= 20) {
-      error_hint = best->error;
-      *out_node  = *best;
-    } else {
-      qoamax_beam_node next_node = {.error = -1};
-      qoamax_encode_slice__beam_scalefactor_search(nodes, nodes_count, buffers, beam_width, depth + 1, scalefactor,
-                                                   lookahead - 20, &samples[20], error_hint, &next_node);
-      if (next_node.error < error_hint) {
-        error_hint = next_node.error;
-        *out_node  = next_node;
-      }
-    }
-  }
-}
+#ifdef QOAMAX_TARGET_BEAM
+#define QOAMAX_VARIANT_SUFFIX __avx2
+#define QOAMAX_VARIANT_TARGET [[gnu::target(QOAMAX_TARGET_BEAM)]]
+#define QOAMAX_BEAM_BRANCHLESS true
+#include "./qoamax_beam.h"
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 //                               Final Encoder                               //
@@ -917,18 +855,6 @@ static uint64_t qoamax_encode_slice__hillclimb(qoamax_encoder_channel *restrict 
   return slice;
 }
 
-//! See @ref qoamax_encode_slice__beam_scalefactor_search. The node buffers of wide beams (about 320 KB) are only on
-//! the stack while this function runs.
-[[gnu::noinline]]
-static void qoamax_encode_slice__beam_scalefactor_search_wide(const qoamax_beam_node *root, int beam_width,
-                                                              int first_scalefactor, int lookahead,
-                                                              const int16_t samples[static restrict lookahead],
-                                                              uint64_t error_hint, qoamax_beam_node *out_node) {
-  qoamax_beam_node buffers[QOAMAX_MAX_LOOKAHEAD_SLICES * 2 * QOAMAX_MAX_BEAM_WIDTH];
-  qoamax_encode_slice__beam_scalefactor_search(root, 1, buffers, beam_width, 0, first_scalefactor, lookahead, samples,
-                                               error_hint, out_node);
-}
-
 //! FAST to PLACEBO: beam search for every scalefactor over the lookahead.
 static uint64_t qoamax_encode_slice__beam(qoamax_encoder_channel *restrict channel, int beam_width, int lookahead,
                                           const int16_t samples[static restrict lookahead]) {
@@ -941,15 +867,14 @@ static uint64_t qoamax_encode_slice__beam(qoamax_encoder_channel *restrict chann
 
   qoamax_beam_node root = {.error = 0, .slice = 0, .lms = channel->lms};
   qoamax_beam_node best = {.error = -1};
-  int slices            = (lookahead + 19) / 20; // depth of the search
-  if (slices * 2 * beam_width <= QOAMAX_SMALL_BEAM_NODES) {
-    qoamax_beam_node buffers[QOAMAX_SMALL_BEAM_NODES];
-    qoamax_encode_slice__beam_scalefactor_search(&root, 1, buffers, beam_width, 0, channel->prev_scalefactor, lookahead,
-                                                 samples, hillclimb_error, &best);
-  } else {
-    qoamax_encode_slice__beam_scalefactor_search_wide(&root, beam_width, channel->prev_scalefactor, lookahead, samples,
-                                                      hillclimb_error, &best);
-  }
+#ifdef QOAMAX_TARGET_BEAM
+  if (qoamax__lanes_supported() >= 8)
+    qoamax_encode_slice__beam_search__avx2(&root, beam_width, channel->prev_scalefactor, lookahead, samples,
+                                           hillclimb_error, &best);
+  else
+#endif
+    qoamax_encode_slice__beam_search(&root, beam_width, channel->prev_scalefactor, lookahead, samples, hillclimb_error,
+                                     &best);
 
   // Use the hill-climb result unless the beam search found a better one.
   // A partial slice (end of the stream) must be left-aligned like a full one.

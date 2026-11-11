@@ -30,16 +30,16 @@ test: $(TEST_LIBS) $(BUILD_DIR)/wavgen $(BUILD_DIR)/qoamax-debug
 $(BUILD_DIR):
 	mkdir -p $@
 
-$(BUILD_DIR)/qoamax-debug: bin/qoamax.c src/qoamax.h src/qoamax.c | $(BUILD_DIR)
+$(BUILD_DIR)/qoamax-debug: bin/qoamax.c src/qoamax.h src/qoamax.c src/qoamax_lanes.h src/qoamax_beam.h | $(BUILD_DIR)
 	$(CC) $(DEBUG_CFLAGS) bin/qoamax.c -o $@ -lm
 
-$(BUILD_DIR)/qoamax: bin/qoamax.c src/qoamax.h src/qoamax.c | $(BUILD_DIR)
+$(BUILD_DIR)/qoamax: bin/qoamax.c src/qoamax.h src/qoamax.c src/qoamax_lanes.h src/qoamax_beam.h | $(BUILD_DIR)
 	$(CC) $(RELEASE_CFLAGS) bin/qoamax.c -o $@ -lm
 
-$(BUILD_DIR)/test_lib: test/test_lib.c test/signal.h src/qoamax.h src/qoamax.c | $(BUILD_DIR)
+$(BUILD_DIR)/test_lib: test/test_lib.c test/signal.h src/qoamax.h src/qoamax.c src/qoamax_lanes.h src/qoamax_beam.h | $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) test/test_lib.c -o $@ -lm
 
-$(BUILD_DIR)/test_lib_lanes%: test/test_lib.c test/signal.h src/qoamax.h src/qoamax.c | $(BUILD_DIR)
+$(BUILD_DIR)/test_lib_lanes%: test/test_lib.c test/signal.h src/qoamax.h src/qoamax.c src/qoamax_lanes.h src/qoamax_beam.h | $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) -DQOAMAX_LANES=$* test/test_lib.c -o $@ -lm
 
 $(BUILD_DIR)/wavgen: test/wavgen.c test/signal.h | $(BUILD_DIR)

@@ -46,7 +46,7 @@ $ qoamax decode output.qoa decoded.wav
 ```
 
 `--effort` selects the speed/quality tradeoff of the encoder: `ultrafast`, `superfast`, `veryfast`, `fast`,
-`medium` (default), `slow`, `veryslow` or `placebo`.
+`medium` (default), `slow`, `veryslow`, `superslow` or `placebo`.
 
 `encode` reads WAV files (8 to 32-bit integer or 32/64-bit float PCM) and raw 16-bit little-endian PCM.
 Raw input is used for `.pcm`/`.raw` files, with `--format=raw`, or when `--rate`/`--channels` is given

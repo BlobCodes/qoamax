@@ -60,6 +60,8 @@ typedef enum {
                                                      //!  encoding both the residuals and the scalefactor.
   QOAMAX_ENCODER_EFFORT_VERYSLOW  = 1 | (16 << 2),   //!< Roughly 2.5dB better than SUPERFAST
                                                      //!  by more greedily encoding residuals.
+  QOAMAX_ENCODER_EFFORT_SUPERSLOW = 2 | (24 << 2),   //!< Roughly 0.15dB better than VERYSLOW by increasing the
+                                                     //!  lookahead to 60 samples and the beam width. 4-5x slower.
   QOAMAX_ENCODER_EFFORT_PLACEBO   = 3 | (1024 << 2), //!< Roughly 3.0dB better than SUPERFAST.
                                                      //!  Maximum quality the current implementation can achieve.
                                                      //!  Can take multiple hours to encode a single minute!

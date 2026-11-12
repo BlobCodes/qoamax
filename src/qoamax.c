@@ -19,8 +19,9 @@
 #define QOAMAX_MAX_LOOKAHEAD_SLICES 4 //!< Largest lookahead of the encoder efforts (80 samples)
 // The beam search's state is sized for the efforts' small beams, so that only wide beams (PLACEBO) need large stack
 // frames (about 350 KB), in separate functions.
-#define QOAMAX_SMALL_BEAM_WIDTH 16 //!< Largest beam width with a small search state
-#define QOAMAX_SMALL_BEAM_NODES 64 //!< Most nodes of all slices of a search kept in a small stack frame
+#define QOAMAX_SMALL_BEAM_WIDTH 24 //!< Largest beam width with a small search state (SUPERSLOW)
+#define QOAMAX_SMALL_BEAM_NODES                                                                     \
+  144 //!< Most nodes of all slices of a search kept in a small stack frame (SUPERSLOW: 3 * 2 * 24)
 
 //! The dequantization values per scalefactor. Each row (a, b, c, d) expands to the
 //! residuals {a, -a, b, -b, c, -c, d, -d}.

@@ -825,7 +825,8 @@ static const struct {
     {"ultrafast", QOAMAX_ENCODER_EFFORT_ULTRAFAST}, {"superfast", QOAMAX_ENCODER_EFFORT_SUPERFAST},
     {"veryfast", QOAMAX_ENCODER_EFFORT_VERYFAST},   {"fast", QOAMAX_ENCODER_EFFORT_FAST},
     {"medium", QOAMAX_ENCODER_EFFORT_MEDIUM},       {"slow", QOAMAX_ENCODER_EFFORT_SLOW},
-    {"veryslow", QOAMAX_ENCODER_EFFORT_VERYSLOW},   {"placebo", QOAMAX_ENCODER_EFFORT_PLACEBO},
+    {"veryslow", QOAMAX_ENCODER_EFFORT_VERYSLOW},   {"superslow", QOAMAX_ENCODER_EFFORT_SUPERSLOW},
+    {"placebo", QOAMAX_ENCODER_EFFORT_PLACEBO},
 };
 
 typedef struct {
@@ -862,7 +863,7 @@ static void print_encode_help(FILE *stream) {
                   "Options:\n"
                   "  -e, --effort=LEVEL    Encoding effort (default: medium):\n"
                   "                        ultrafast, superfast, veryfast, fast,\n"
-                  "                        medium, slow, veryslow, or placebo\n"
+                  "                        medium, slow, veryslow, superslow, or placebo\n"
                   "  -f, --format=FORMAT   Input format: wav or raw (default: wav, or raw for\n"
                   "                        .pcm/.raw files and when --rate or --channels is given)\n"
                   "  -r, --rate=HZ         Samplerate of raw input (default: 48000)\n"
@@ -935,7 +936,7 @@ static parse_result parse_options(int argc, char **argv, bool encode, options *o
       while (i < sizeof efforts / sizeof efforts[0] && strcmp(optarg, efforts[i].name) != 0) i++;
       if (i == sizeof efforts / sizeof efforts[0]) {
         print_error("invalid effort '%s' (valid: ultrafast, superfast, veryfast, fast, medium, slow, veryslow, "
-                    "placebo)",
+                    "superslow, placebo)",
                     optarg);
         return PARSE_EXIT_FAILURE;
       }

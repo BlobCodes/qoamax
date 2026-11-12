@@ -138,6 +138,7 @@ static const struct {
     {"medium", QOAMAX_ENCODER_EFFORT_MEDIUM, 2, 10317, 0x709F0163D8396102, 0x2C8F42448B05E9B6},
     {"slow", QOAMAX_ENCODER_EFFORT_SLOW, 2, 10317, 0x1A40E55B4EB2AE62, 0x889B3C7BDD140149},
     {"veryslow", QOAMAX_ENCODER_EFFORT_VERYSLOW, 1, 6000, 0x0FAF1EE5C2914745, 0xF27ECCC8D35EB97F},
+    {"superslow", QOAMAX_ENCODER_EFFORT_SUPERSLOW, 1, 3000, 0xAD4059814F84EF7F, 0xF250667681F9FF04},
     {"placebo", QOAMAX_ENCODER_EFFORT_PLACEBO, 1, 100, 0xF92501D63341B662, 0x5332B08CB36D1716},
     {"hill-climb, 60-sample lookahead", (qoamax_encoder_effort)2, 2, 10317, 0x6D5D577D032DF79E, 0xD0FF5EBD73FB4FC6},
     {"hill-climb, 80-sample lookahead", (qoamax_encoder_effort)3, 2, 10317, 0x0D392AD93F818114, 0x12ABA06CDC916916},
@@ -535,7 +536,7 @@ static void test_invalid_files(void) {
 ///////////////////////////////////////////////////////////////////////////////
 
 #ifndef TEST_STACK_SIZE
-#define TEST_STACK_SIZE (32 * 1024) //!< Stack of the thread running ULTRAFAST to VERYSLOW (they need about 6 KB)
+#define TEST_STACK_SIZE (32 * 1024) //!< Stack of the thread running ULTRAFAST to SUPERSLOW (they need about 10 KB)
 #endif
 
 static void *encode_efforts_thread(void *unused) {
@@ -543,7 +544,7 @@ static void *encode_efforts_thread(void *unused) {
   static const qoamax_encoder_effort efforts[] = {
       QOAMAX_ENCODER_EFFORT_ULTRAFAST, QOAMAX_ENCODER_EFFORT_SUPERFAST, QOAMAX_ENCODER_EFFORT_VERYFAST,
       QOAMAX_ENCODER_EFFORT_FAST,      QOAMAX_ENCODER_EFFORT_MEDIUM,    QOAMAX_ENCODER_EFFORT_SLOW,
-      QOAMAX_ENCODER_EFFORT_VERYSLOW,
+      QOAMAX_ENCODER_EFFORT_VERYSLOW,  QOAMAX_ENCODER_EFFORT_SUPERSLOW,
   };
   int16_t *signal = make_signal(2, 300, 7);
   for (size_t i = 0; i < sizeof efforts / sizeof efforts[0]; i++) free(encode_all(efforts[i], 2, 300, signal).data);
@@ -551,7 +552,7 @@ static void *encode_efforts_thread(void *unused) {
   return NULL;
 }
 
-//! The efforts up to VERYSLOW must run with little stack (e.g. on embedded targets or threads with small stacks).
+//! The efforts up to SUPERSLOW must run with little stack (e.g. on embedded targets or threads with small stacks).
 //! A crash here means that the encoder uses too much stack.
 static void test_stack_usage(void) {
   pthread_attr_t attributes;

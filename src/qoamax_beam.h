@@ -35,7 +35,7 @@ static int qoamax_encode_beam_search__wide(const qoamax_beam_node *restrict src,
                                         error_hint, out, slots, predicted, QOAMAX_BEAM_BRANCHLESS);
 }
 
-//! See @ref qoamax_encode_beam_search_impl. The small beam widths used by the encoder efforts (2, 4 and
+//! See @ref qoamax_encode_beam_search_impl. The small beam widths used by the encoder efforts (2, 4, 16 and
 //! QOAMAX_SMALL_BEAM_WIDTH) get their own copies. The caller chooses between this and the wide variant, which keeps
 //! this function free of calls (otherwise gcc's code gets about 3% slower).
 QOAMAX_VARIANT_TARGET
@@ -55,6 +55,9 @@ static int qoamax_encode_beam_search(const qoamax_beam_node *restrict src, int s
                                           error_hint, out, slots, predicted, QOAMAX_BEAM_BRANCHLESS);
   case 4:
     return qoamax_encode_beam_search_impl(src, src_count, buffers, 4, first_slice, samples_size, samples, scalefactor,
+                                          error_hint, out, slots, predicted, QOAMAX_BEAM_BRANCHLESS);
+  case 16:
+    return qoamax_encode_beam_search_impl(src, src_count, buffers, 16, first_slice, samples_size, samples, scalefactor,
                                           error_hint, out, slots, predicted, QOAMAX_BEAM_BRANCHLESS);
   default:
     return qoamax_encode_beam_search_impl(src, src_count, buffers, QOAMAX_SMALL_BEAM_WIDTH, first_slice, samples_size,
@@ -77,7 +80,7 @@ static void qoamax_encode_slice__beam_scalefactor_search(const qoamax_beam_node 
     if ((unsigned)scalefactor >= 16) continue;
 
     qoamax_beam_node *nodes;
-    bool small      = beam_width == 2 || beam_width == 4 || beam_width == QOAMAX_SMALL_BEAM_WIDTH;
+    bool small      = beam_width == 2 || beam_width == 4 || beam_width == 16 || beam_width == QOAMAX_SMALL_BEAM_WIDTH;
     int nodes_count = (small ? qoamax_encode_beam_search : qoamax_encode_beam_search__wide)(
         src, src_count, &buffers[depth * 2 * beam_width], beam_width, depth == 0, QOAMAX_MIN(20, lookahead), samples,
         scalefactor, error_hint, &nodes);

@@ -138,7 +138,7 @@ cp in.pcm in.raw
 expect_ok "raw by extension .raw" "$Q" encode -e superfast -c 2 -r 44100 in.raw ext.qoa
 expect_same "raw by extension .raw" raw.qoa ext.qoa
 
-for effort in ultrafast superfast veryfast fast medium slow veryslow; do
+for effort in ultrafast superfast veryfast fast medium slow veryslow superslow; do
   "$W" raw 1 300 short.pcm || exit 2
   expect_ok "effort $effort" "$Q" encode -e $effort -c 1 short.pcm short_$effort.qoa
 done

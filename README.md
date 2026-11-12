@@ -10,7 +10,7 @@ and compiles with any C23 compiler, including cproc. With gcc or clang it also u
 QOAMAX features an optimized decoder implementation tuned for various SIMD extensions (2.5x on a Ryzen 5900X).
 
 QOAMAX implements multiple parametrizable, optimized encoders, from highly performant to high-quality.  
-On a pop song, the tradeoff currently looks like this (Ryzen 5900X, placebo and ultrafast missing):  
+On average over 9 audio files (various music genres, sfx), the tradeoff currently looks like this (Ryzen 5900X, placebo and ultrafast missing):  
 ![Graph showing the speed-quality tradeoff](assets/qoa_pareto.svg)
 
 ## Compilation

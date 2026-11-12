@@ -4,7 +4,7 @@
 project(
   'qoamax',
   'c',
-  version: '0.1.0', # Keep in sync with QOAMAX_VERSION_* in src/qoamax.h (checked by make test-build-systems).
+  version: '0.1.1', # Keep in sync with QOAMAX_VERSION_* in src/qoamax.h (checked by make test-build-systems).
   license: 'EUPL-1.2',
   license_files: 'LICENSE.md',
   meson_version: '>=1.4.0', # c_std=c23

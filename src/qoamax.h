@@ -9,7 +9,7 @@
 
 #define QOAMAX_VERSION_MAJOR 0
 #define QOAMAX_VERSION_MINOR 1
-#define QOAMAX_VERSION_PATCH 0
+#define QOAMAX_VERSION_PATCH 1
 
 #define QOAMAX_MAX_CHANNEL_COUNT 8
 #define QOAMAX_FRAME_SAMPLES 5120 //!< Samples per channel in a full frame

@@ -1,0 +1,10 @@
+prefix=@PREFIX@
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: qoamax
+Description: High-quality QOA (Quite OK Audio) encoder and decoder library
+URL: https://gitlab.com/BlobCodes/qoamax
+Version: @VERSION@
+Libs: -L${libdir} -lqoamax
+Cflags: -I${includedir}

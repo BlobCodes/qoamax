@@ -6,3 +6,25 @@ CompileFlags:
 
 Documentation:
   CommentFormat: Doxygen
+
+---
+# The plain declarations, as used by C compilers without VLAs (otherwise qoamax.h declares the functions too).
+If:
+  PathMatch: src/qoamax_plain\.h
+CompileFlags:
+  Add: [-D__STDC_NO_VLA__=1]
+
+---
+# The C++ test.
+If:
+  PathMatch: .*\.cpp
+CompileFlags:
+  Remove: [-xc, -std=c23]
+  Add: [-xc++, -std=c++17]
+
+---
+# The tests and the example include the library's header like its users (<qoamax.h>).
+If:
+  PathMatch: test/.*
+CompileFlags:
+  Add: [-I../src]

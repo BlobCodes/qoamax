@@ -1,7 +1,15 @@
+// The header is C11 (and C++11) without extensions. Only qoamax.c needs C23.
 #pragma once
+#ifndef __cplusplus
+#include <stdalign.h>
+#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
+#define QOAMAX_VERSION_MAJOR 0
+#define QOAMAX_VERSION_MINOR 1
+#define QOAMAX_VERSION_PATCH 0
 
 #define QOAMAX_MAX_CHANNEL_COUNT 8
 #define QOAMAX_FRAME_SAMPLES 5120 //!< Samples per channel in a full frame
@@ -12,8 +20,9 @@
 #define QOAMAX_ERROR_SAMPLE_FORMAT_BREAK -4
 #define QOAMAX_ERROR_UNSUPPORTED_CHANNEL_COUNT -5
 
-typedef struct [[gnu::aligned(8)]] {
-  int16_t history[4];
+typedef struct {
+  // 8-byte aligned, so that RISC-V can load and store the state with 64-bit accesses. This is part of the ABI.
+  alignas(8) int16_t history[4];
   int32_t weights[4];
 } qoamax_lms;
 
@@ -73,10 +82,17 @@ typedef struct {
   qoamax_encoder_channel channels[QOAMAX_MAX_CHANNEL_COUNT];
 } qoamax_encoder;
 
-[[maybe_unused]] static const qoamax_lms QOAMAX_LMS_INITIAL = {
-    .history = {0, 0, 0, 0},
-    .weights = {0, 0, -(1 << 13), (1 << 14)},
+//! The LMS state at the start of a stream (history, weights).
+static const qoamax_lms QOAMAX_LMS_INITIAL = {
+    {0, 0, 0, 0},
+    {0, 0, -(1 << 13), (1 << 14)},
 };
+
+// C++ has no restrict or [static n] array parameters, and C11 compilers may not support the variable ones
+// (__STDC_NO_VLA__, e.g. MSVC), so they get the function declarations from qoamax_plain.h.
+#if defined(__cplusplus) || defined(__STDC_NO_VLA__)
+#include "qoamax_plain.h"
+#else
 
 ////////////////////
 //      Core      //
@@ -108,9 +124,7 @@ uint64_t qoamax_encode_slice(qoamax_encoder_channel *restrict channel, qoamax_en
 
 //! Returns the amount of continuous samples @ref qoamax_encode_slice looks at to produce a 64-bit slice for this
 //! effort option (its samples_size should be at least this large, except at the end of the stream).
-[[maybe_unused]] static inline int qoamax_encoder_effort_get_lookahead(qoamax_encoder_effort effort) {
-  return ((effort & 3) + 1) * 20;
-}
+static inline int qoamax_encoder_effort_get_lookahead(qoamax_encoder_effort effort) { return ((effort & 3) + 1) * 20; }
 
 ////////////////////
 //    Decoder     //
@@ -164,8 +178,7 @@ int qoamax_decoder_read_interleaved(qoamax_decoder *restrict self, size_t file_s
 //!
 //! NOTE: channel_count must be between 1 and 8, samples_per_channel must be > 0.
 //!       The result is undefined otherwise.
-[[maybe_unused]] static inline uint64_t qoamax_encoder_get_encoded_size(int channel_count,
-                                                                        uint32_t samples_per_channel) {
+static inline uint64_t qoamax_encoder_get_encoded_size(int channel_count, uint32_t samples_per_channel) {
   uint64_t frames = ((uint64_t)samples_per_channel + QOAMAX_FRAME_SAMPLES - 1) / QOAMAX_FRAME_SAMPLES;
   uint64_t slices = ((uint64_t)samples_per_channel + 19) / 20; // per channel
 
@@ -231,7 +244,9 @@ int qoamax_encoder_write_interleaved(qoamax_encoder *restrict self, size_t file_
                                      bool samples_complete);
 
 //! Returns the cumulated squared error up to the current encoding position for each channel.
-[[maybe_unused]] static inline void qoamax_encoder_get_error(const qoamax_encoder *self,
-                                                             uint64_t errors[static restrict self->channel_count]) {
+static inline void qoamax_encoder_get_error(const qoamax_encoder *self,
+                                            uint64_t errors[static restrict self->channel_count]) {
   for (int i = 0; i < self->channel_count; i++) errors[i] = self->channels[i].error;
 }
+
+#endif

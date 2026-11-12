@@ -1,0 +1,1 @@
+option('cli', type: 'feature', value: 'auto', description: 'Build the qoamax command line tool (auto: unless a subproject)')

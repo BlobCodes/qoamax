@@ -8,8 +8,8 @@
 #include <stdint.h>
 
 #define QOAMAX_VERSION_MAJOR 0
-#define QOAMAX_VERSION_MINOR 1
-#define QOAMAX_VERSION_PATCH 1
+#define QOAMAX_VERSION_MINOR 2
+#define QOAMAX_VERSION_PATCH 0
 
 #define QOAMAX_MAX_CHANNEL_COUNT 8
 #define QOAMAX_FRAME_SAMPLES 5120 //!< Samples per channel in a full frame
@@ -48,7 +48,9 @@ typedef struct {
 //! A value packs the lookahead in slices minus one (bits 0-1) and the beam width (the remaining bits, 0 = hill-climb,
 //! negative = ULTRAFAST).
 typedef enum {
-  QOAMAX_ENCODER_EFFORT_ULTRAFAST = -4,              //!< Bad quality, but almost as fast as the decoder.
+  QOAMAX_ENCODER_EFFORT_ULTRAFAST = -4,              //!< Roughly 1.0dB worse than SUPERFAST, but about 3x as fast
+                                                     //!  (with SIMD). Chooses the scalefactor from an estimate and
+                                                     //!  encodes several frames at once.
   QOAMAX_ENCODER_EFFORT_SUPERFAST = 0,               //!< Similar quality to reference encoder.
   QOAMAX_ENCODER_EFFORT_VERYFAST  = 1,               //!< Roughly 0.5dB better than SUPERFAST by increasing the
                                                      //!  lookahead to 40 samples when encoding scalefactors.
@@ -80,8 +82,13 @@ typedef struct {
   uint16_t frame_slices; //!< Slices per channel left in the current frame (0 = next write starts a frame).
   uint8_t channel_count;
   bool header_written;
+  uint32_t frame_index; //!< Number of frames started so far (wraps around)
 
   qoamax_encoder_channel channels[QOAMAX_MAX_CHANNEL_COUNT];
+
+  // ULTRAFAST encodes groups of frames independently of each other (see qoamax.c), which start with these values:
+  int16_t group_weights[QOAMAX_MAX_CHANNEL_COUNT][4]; //!< The LMS weights at the end of the previous group
+  int16_t last_samples[QOAMAX_MAX_CHANNEL_COUNT][4];  //!< The last four input samples
 } qoamax_encoder;
 
 //! The LMS state at the start of a stream (history, weights).
@@ -89,6 +96,60 @@ static const qoamax_lms QOAMAX_LMS_INITIAL = {
     {0, 0, 0, 0},
     {0, 0, -(1 << 13), (1 << 14)},
 };
+
+//! One stream of samples for @ref qoamax_encode_streams, which encodes many streams at once: a channel of an audio
+//! track, a separate track, or a block of a channel in your own container format (see qoamax_encode_streams).
+//! Create it with @ref qoamax_encode_stream_init. The encoder advances `samples` and `slices` as it encodes, so a
+//! stream can be passed again with more samples or more room for slices.
+typedef struct {
+  qoamax_encoder_channel channel; //!< The encoder's state (and the squared error of the samples encoded so far)
+  const int16_t *samples;         //!< The next sample to encode; sample i is samples[i * sample_stride]
+  size_t samples_size;            //!< The number of samples from `samples` on
+  int sample_stride;              //!< 1 for a channel of its own, the channel count for interleaved channels
+  uint64_t *slices;               //!< Where the next encoded slice is stored
+  size_t slices_size;             //!< Room for slices from `slices` on
+} qoamax_encode_stream;
+
+//! One stream of slices for @ref qoamax_decode_streams, which decodes many streams at once (the counterpart of
+//! @ref qoamax_encode_stream). Create it with @ref qoamax_decode_stream_init.
+typedef struct {
+  qoamax_lms lms;         //!< The decoder's state: QOAMAX_LMS_INITIAL, or the state the encoder started with
+  const uint64_t *slices; //!< The next slice to decode
+  size_t slices_size;     //!< The number of slices from `slices` on
+  int16_t *samples;       //!< Where the next decoded sample is stored; sample i is samples[i * sample_stride]
+  size_t samples_size;    //!< The number of samples left to decode (room from `samples` on, and the stream's length)
+  int sample_stride;      //!< 1 for a channel of its own, the channel count for interleaved channels
+} qoamax_decode_stream;
+
+//! Returns a stream that encodes the samples (sample i is samples[i * sample_stride]) from the start of the audio, into
+//! room for slices_size slices (one per 20 samples, rounded up, for all of them).
+static inline qoamax_encode_stream qoamax_encode_stream_init(const int16_t *samples, size_t samples_size,
+                                                             int sample_stride, uint64_t *slices, size_t slices_size) {
+  qoamax_encode_stream stream;
+  stream.channel.lms              = QOAMAX_LMS_INITIAL;
+  stream.channel.prev_scalefactor = 0;
+  stream.channel.error            = 0;
+  stream.samples                  = samples;
+  stream.samples_size             = samples_size;
+  stream.sample_stride            = sample_stride;
+  stream.slices                   = slices;
+  stream.slices_size              = slices_size;
+  return stream;
+}
+
+//! Returns a stream that decodes the slices of an encoded stream (from its start) into samples_size samples (sample i
+//! is stored at samples[i * sample_stride]).
+static inline qoamax_decode_stream qoamax_decode_stream_init(const uint64_t *slices, size_t slices_size,
+                                                             int16_t *samples, size_t samples_size, int sample_stride) {
+  qoamax_decode_stream stream;
+  stream.lms           = QOAMAX_LMS_INITIAL;
+  stream.slices        = slices;
+  stream.slices_size   = slices_size;
+  stream.samples       = samples;
+  stream.samples_size  = samples_size;
+  stream.sample_stride = sample_stride;
+  return stream;
+}
 
 // C++ has no restrict or [static n] array parameters, and C11 compilers may not support the variable ones
 // (__STDC_NO_VLA__, e.g. MSVC), so they get the function declarations from qoamax_plain.h.
@@ -123,6 +184,55 @@ void qoamax_decode_slice(qoamax_lms *restrict lms, uint64_t slice, int16_t out[s
 //! @returns the encoded slice.
 uint64_t qoamax_encode_slice(qoamax_encoder_channel *restrict channel, qoamax_encoder_effort effort, int samples_size,
                              const int16_t samples[static restrict samples_size]);
+
+//! Encodes many independent streams at once (e.g. the channels of a track), which is faster than encoding them one
+//! by one with @ref qoamax_encode_slice: ULTRAFAST encodes several streams in parallel in SIMD lanes (4 streams fill
+//! AVX2). Every stream gives the same slices as encoding it slice by slice with qoamax_encode_slice, whichever streams
+//! are passed together, in which order, and on any CPU.
+//!
+//! Each stream encodes as many slices as its samples and its room for slices allow, and advances its `samples` and
+//! `slices` past them. The streams may have different lengths.
+//! - samples_complete = true: the streams end after their samples_size samples. All of them are encoded; the last slice
+//!   may hold fewer than 20 samples.
+//! - samples_complete = false: more samples follow later. Only slices whose whole lookahead
+//!   (@ref qoamax_encoder_effort_get_lookahead) is available are encoded, so a stream may have samples left. Pass it
+//!   again with these and the new samples.
+//!
+//! Example: encode a stereo track (n interleaved samples per channel) into one array of slices per channel.
+//! @code
+//! size_t slice_count = (n + 19) / 20;
+//! qoamax_encode_stream streams[2];
+//! for (int ch = 0; ch < 2; ch++)
+//!   streams[ch] = qoamax_encode_stream_init(&samples[ch], n, 2, slices[ch], slice_count);
+//! qoamax_encode_streams(QOAMAX_ENCODER_EFFORT_ULTRAFAST, 2, streams, true);
+//! @endcode
+//!
+//! A single channel can also be split into blocks that are encoded at once, if your container stores the LMS state
+//! each block starts with (like the QOA frame headers): start the block's stream with channel.lms.history = the 4 input
+//! samples before the block and channel.lms.weights = the weights at the end of an earlier block (QOAMAX_LMS_INITIAL's
+//! weights cost about 0.7 dB), store that state, and start the block's decoder with it.
+//!
+//! @param effort       The effort of all streams. It may not change while a stream is encoded.
+//! @param stream_count The number of streams, at least 1.
+void qoamax_encode_streams(qoamax_encoder_effort effort, size_t stream_count, qoamax_encode_stream streams[stream_count],
+                           bool samples_complete);
+
+//! Decodes many independent streams at once, which is faster than decoding them one by one with
+//! @ref qoamax_decode_slice: at least 4 streams (and half of the SIMD lanes, 4 of 8 with AVX2) are decoded in parallel.
+//!
+//! Each stream decodes as many slices as it has, up to its samples_size samples, and advances its `slices` and
+//! `samples` past them. If samples_size isn't a multiple of 20, the last slice is decoded only partially (the end of
+//! the stream). The streams may have different lengths.
+//!
+//! Example: decode the slices of a stereo track into interleaved samples.
+//! @code
+//! qoamax_decode_stream streams[2];
+//! for (int ch = 0; ch < 2; ch++)
+//!   streams[ch] = qoamax_decode_stream_init(slices[ch], slice_count, &samples[ch], samples_per_channel, 2);
+//! qoamax_decode_streams(2, streams);
+//! @endcode
+//! @param stream_count The number of streams, at least 1.
+void qoamax_decode_streams(size_t stream_count, qoamax_decode_stream streams[stream_count]);
 
 //! Returns the amount of continuous samples @ref qoamax_encode_slice looks at to produce a 64-bit slice for this
 //! effort option (its samples_size should be at least this large, except at the end of the stream).

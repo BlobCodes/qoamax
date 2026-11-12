@@ -1,4 +1,5 @@
-// Example from the README: encodes one second of stereo audio to QOA in memory and decodes it again.
+// Example: encodes one second of stereo audio to QOA in memory and decodes it again, then does the same without the
+// file format, with the stream API (as in the README).
 // test/build_systems.sh builds it against the installed library (as C11) to check the build systems.
 #include <qoamax.h>
 #include <stdio.h>
@@ -39,5 +40,20 @@ int main(void) {
          (unsigned)query.channel_count, (unsigned)query.total_samples);
 
   free(file);
-  return write == decoded + count * channels ? 0 : 1;
+  if (write != decoded + count * channels) return 1;
+
+  // The stream API: one array of slices per channel, for your own container format.
+  enum { slice_count = (count + 19) / 20 };
+  static uint64_t slices[channels][slice_count];
+  qoamax_encode_stream encode[channels];
+  for (int ch = 0; ch < channels; ch++)
+    encode[ch] = qoamax_encode_stream_init(&samples[ch], count, channels, slices[ch], slice_count);
+  qoamax_encode_streams(QOAMAX_ENCODER_EFFORT_ULTRAFAST, channels, encode, true);
+
+  qoamax_decode_stream decode[channels];
+  for (int ch = 0; ch < channels; ch++)
+    decode[ch] = qoamax_decode_stream_init(slices[ch], slice_count, &decoded[ch], count, channels);
+  qoamax_decode_streams(channels, decode);
+  printf("Encoded and decoded %d slices per channel with the stream API\n", slice_count);
+  return decode[0].samples_size == 0 && decode[1].samples_size == 0 ? 0 : 1;
 }

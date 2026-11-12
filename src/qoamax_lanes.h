@@ -1,5 +1,5 @@
-// The SIMD scalefactor search (one lane per scalefactor). Not a public header: qoamax.c includes this file once per
-// SIMD variant, after defining
+// The SIMD scalefactor search (one lane per scalefactor), ULTRAFAST (two lanes per stream) and the decoder (one lane
+// per stream). Not a public header: qoamax.c includes this file once per SIMD variant, after defining
 // - QOAMAX_VARIANT_LANES:  the number of lanes (2, 4, 8 or 16),
 // - QOAMAX_VARIANT_SUFFIX: appended to every name defined here (empty for the compile target's default variant),
 // - QOAMAX_VARIANT_TARGET: an attribute for every function, e.g. [[gnu::target("avx2")]] (or empty).
@@ -10,6 +10,9 @@ static_assert(QOAMAX_VARIANT_LANES >= 2 && QOAMAX_VARIANT_LANES <= 16 && 16 % QO
 // The names defined here, renamed per variant (e.g. qoamax_hillclimb_lanes__x8), so that the code below reads as usual.
 #define qoamax_vi32 QOAMAX_VARIANT_NAME(qoamax_vi32)
 #define qoamax_vu32 QOAMAX_VARIANT_NAME(qoamax_vu32)
+#define qoamax_vu64 QOAMAX_VARIANT_NAME(qoamax_vu64)
+#define qoamax_lanes_swap_pairs QOAMAX_VARIANT_NAME(qoamax_lanes_swap_pairs)
+#define qoamax_lanes_take_pair QOAMAX_VARIANT_NAME(qoamax_lanes_take_pair)
 #define qoamax_lanes_table QOAMAX_VARIANT_NAME(qoamax_lanes_table)
 #define qoamax_lanes_state QOAMAX_VARIANT_NAME(qoamax_lanes_state)
 #define qoamax_hillclimb_lanes_step QOAMAX_VARIANT_NAME(qoamax_hillclimb_lanes_step)
@@ -22,12 +25,15 @@ static_assert(QOAMAX_VARIANT_LANES >= 2 && QOAMAX_VARIANT_LANES <= 16 && 16 % QO
   QOAMAX_VARIANT_NAME(qoamax_encode_slice__hillclimb_scalefactor_search_lanes_impl)
 #define qoamax_encode_slice__hillclimb_scalefactor_search_lanes                \
   QOAMAX_VARIANT_NAME(qoamax_encode_slice__hillclimb_scalefactor_search_lanes)
-#define qoamax_encode_slice__ultrafast_lanes QOAMAX_VARIANT_NAME(qoamax_encode_slice__ultrafast_lanes)
+#define qoamax_encode_ultrafast_lanes QOAMAX_VARIANT_NAME(qoamax_encode_ultrafast_lanes)
+#define qoamax_decode_lanes QOAMAX_VARIANT_NAME(qoamax_decode_lanes)
+#define qoamax_simd QOAMAX_VARIANT_NAME(qoamax_simd)
 #define qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped                \
   QOAMAX_VARIANT_NAME(qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped)
 
 typedef int32_t qoamax_vi32 __attribute__((vector_size(QOAMAX_VARIANT_LANES * 4)));
 typedef uint32_t qoamax_vu32 __attribute__((vector_size(QOAMAX_VARIANT_LANES * 4)));
+typedef uint64_t qoamax_vu64 __attribute__((vector_size(QOAMAX_VARIANT_LANES * 4)));
 
 //! The table columns of one lane window (see @ref qoamax_lanes_dqt).
 typedef struct {
@@ -337,25 +343,272 @@ static uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclampe
                                                                       error_hint, out_slice, out_error, true);
 }
 
-#if QOAMAX_VARIANT_LANES >= 4
-//! SIMD version of @ref qoamax_encode_slice__ultrafast_scalar with identical results: the scalefactors
-//! prev_scalefactor - 1 and + 1 are lanes 0 and 2 of one lane window (the lanes in between are computed, but ignored).
+//! Sets *other to v with the two lanes of every stream (2u and 2u + 1) swapped.
+//! (Vectors are passed by pointer: gcc warns about vector return values, as their ABI depends on the target.)
 QOAMAX_VARIANT_TARGET
-static uint64_t qoamax_encode_slice__ultrafast_lanes(qoamax_lms *lms, int prev_scalefactor, int samples_count,
-                                                     const int16_t samples[static restrict samples_count],
-                                                     uint64_t *out_error) {
-  qoamax_scalefactor_results results;
-  int column = (prev_scalefactor - 1) & 15;
-  qoamax_hillclimb_lanes(lms, samples_count, samples, column, 0, UINT64_MAX, &results);
-  int best   = results.errors[2] < results.errors[0] ? 2 : 0;
-  *out_error = results.errors[best];
-  return qoamax_scalefactor_results_get(&results, best, (column + best) & 15, samples_count, lms);
+[[gnu::always_inline]]
+static inline void qoamax_lanes_swap_pairs(qoamax_vi32 *other, qoamax_vi32 v) {
+  qoamax_vu64 pairs = (qoamax_vu64)v;
+  *other            = (qoamax_vi32)(pairs << 32 | pairs >> 32);
 }
-#endif
+
+//! Sets both lanes of a stream to the value of the other lane where `take` is set.
+QOAMAX_VARIANT_TARGET
+[[gnu::always_inline]]
+static inline void qoamax_lanes_take_pair(qoamax_vi32 *v, qoamax_vi32 take) {
+  qoamax_vi32 other;
+  qoamax_lanes_swap_pairs(&other, *v);
+  *v = (other & take) | (*v & ~take);
+}
+
+//! SIMD version of @ref qoamax_encode_ultrafast_scalar with identical results, for up to QOAMAX_VARIANT_LANES / 2
+//! streams at once: stream u uses lanes 2u and 2u + 1, one per scalefactor candidate. Encodes slice_count full slices
+//! (20 samples each) of every stream.
+QOAMAX_VARIANT_TARGET
+static void qoamax_encode_ultrafast_lanes(qoamax__stream *restrict streams, int count, int slice_count) {
+  constexpr int lanes = QOAMAX_VARIANT_LANES;
+  qoamax_assume(count >= 1 && count <= lanes / 2);
+  qoamax_assume(slice_count >= 1);
+
+  // The LMS states by lane (unused lanes are zero). Both lanes of a stream get the same value, which is stored as one
+  // 64-bit value (the compilers store the int32 values one by one). They stay in vectors until the last slice.
+  int32_t lms[8][lanes];
+  int32_t odd_lanes[lanes];
+  if (count < lanes / 2) memset(lms, 0, sizeof lms);
+  for (int u = 0; u < count; u++) {
+    for (int k = 0; k < 4; k++) {
+      uint64_t history = (uint32_t)streams[u].state.lms.history[k] * UINT64_C(0x100000001);
+      uint64_t weights = (uint32_t)streams[u].state.lms.weights[k] * UINT64_C(0x100000001);
+      memcpy(&lms[k][2 * u], &history, sizeof history), memcpy(&lms[4 + k][2 * u], &weights, sizeof weights);
+    }
+  }
+  for (int lane = 0; lane < lanes; lane++) odd_lanes[lane] = -(lane & 1);
+
+  qoamax_vi32 h0, h1, h2, h3, w0, w1, w2, w3, odd;
+  memcpy(&h0, lms[0], sizeof h0), memcpy(&h1, lms[1], sizeof h1), memcpy(&h2, lms[2], sizeof h2);
+  memcpy(&h3, lms[3], sizeof h3), memcpy(&w0, lms[4], sizeof w0), memcpy(&w1, lms[5], sizeof w1);
+  memcpy(&w2, lms[6], sizeof w2), memcpy(&w3, lms[7], sizeof w3), memcpy(&odd, odd_lanes, sizeof odd);
+
+  // The error of the slices encoded so far (biased, see qoamax_lanes_state). Both lanes of a stream start every slice
+  // with the same error, so comparing the sums compares the candidates.
+  const qoamax_vi32 bias = (qoamax_vi32){} + INT32_MIN;
+  qoamax_vi32 error_low = bias, error_high = bias, scalefactor = {};
+
+  for (int s = 0; s < slice_count; s++) {
+    // The samples by lane, like the LMS states.
+    int32_t samples[20][lanes];
+    if (count < lanes / 2) memset(samples, 0, sizeof samples);
+    for (int u = 0; u < count; u++) {
+      const int16_t *stream_samples = streams[u].samples;
+      int stride                    = streams[u].sample_stride;
+      for (int i = 0; i < 20; i++) {
+        uint64_t pair = (uint32_t)stream_samples[i * stride] * UINT64_C(0x100000001);
+        memcpy(&samples[i][2 * u], &pair, sizeof pair);
+      }
+    }
+
+    // The estimate (see qoamax_ultrafast_estimate): independent predictions from the input samples.
+    qoamax_vi32 x0 = h0, x1 = h1, x2 = h2, x3 = h3, max_residual = {};
+    for (int i = 0; i < 20; i++) {
+      qoamax_vi32 sample;
+      memcpy(&sample, samples[i], sizeof sample);
+      qoamax_vu32 sum      = (qoamax_vu32)w0 * (qoamax_vu32)x0 + (qoamax_vu32)w1 * (qoamax_vu32)x1 +
+                             (qoamax_vu32)w2 * (qoamax_vu32)x2 + (qoamax_vu32)w3 * (qoamax_vu32)x3;
+      qoamax_vi32 residual = sample - ((qoamax_vi32)sum >> 13);
+      qoamax_vi32 abs      = (residual ^ (residual >> 31)) - (residual >> 31);
+      qoamax_vi32 greater  = abs > max_residual;
+      max_residual         = (abs & greater) | (max_residual & ~greater);
+      x0 = x1, x1 = x2, x2 = x3, x3 = sample;
+    }
+    qoamax_vi32 estimate = {};
+    for (int k = 0; k < 14; k++) estimate -= max_residual > qoamax_ultrafast_thresholds[k];
+
+    // The table columns of each lane's scalefactor: stream u tries estimate and estimate + 1.
+    int32_t columns[7][lanes];
+    if (count < lanes / 2) memset(columns, 0, sizeof columns);
+    for (int u = 0; u < count; u++) {
+      int first = estimate[2 * u];
+      for (int k = 0; k < 3; k++) memcpy(&columns[k][2 * u], &qoamax_lanes_qt[k][first], 2 * sizeof(int32_t));
+      for (int k = 0; k < 4; k++) memcpy(&columns[3 + k][2 * u], &qoamax_lanes_dqt[k][first], 2 * sizeof(int32_t));
+    }
+    qoamax_lanes_table t;
+    memcpy(&t.q0, columns[0], sizeof t.q0), memcpy(&t.q1, columns[1], sizeof t.q1);
+    memcpy(&t.q2, columns[2], sizeof t.q2), memcpy(&t.d0, columns[3], sizeof t.d0);
+    memcpy(&t.d1, columns[4], sizeof t.d1), memcpy(&t.d2, columns[5], sizeof t.d2);
+    memcpy(&t.d3, columns[6], sizeof t.d3);
+
+    // The hill-climb of every lane (like qoamax_hillclimb_lanes_step, without bound), collecting the residuals in two
+    // halves of 10 samples (30 bits each).
+    qoamax_vi32 quant_high = {}, quant_low = {};
+    QOAMAX_PRAGMA(GCC unroll 2)
+    for (int i = 0; i < 20; i++) {
+      qoamax_vi32 sample;
+      memcpy(&sample, samples[i], sizeof sample);
+      qoamax_vu32 sum       = (qoamax_vu32)w0 * (qoamax_vu32)h0 + (qoamax_vu32)w1 * (qoamax_vu32)h1 +
+                              (qoamax_vu32)w2 * (qoamax_vu32)h2 + (qoamax_vu32)w3 * (qoamax_vu32)h3;
+      qoamax_vi32 predicted = (qoamax_vi32)sum >> 13;
+      qoamax_vi32 residual  = sample - predicted;
+      qoamax_vi32 negative  = residual <= 0;
+      qoamax_vi32 abs       = (residual ^ (residual >> 31)) - (residual >> 31);
+      qoamax_vi32 above0 = abs > t.q0, above1 = abs > t.q1, above2 = abs > t.q2;
+
+      qoamax_vi32 magnitude   = t.d0 + (above0 & t.d1) + (above1 & t.d2) + (above2 & t.d3);
+      qoamax_vi32 dequantized = (magnitude ^ negative) - negative;
+      qoamax_vi32 quant       = (-(above0 + above1 + above2) << 1) | (negative & 1);
+      if (i < 10)
+        quant_high = quant_high << 3 | quant;
+      else
+        quant_low = quant_low << 3 | quant;
+
+      qoamax_vi32 reconstructed = predicted + dequantized;
+      qoamax_vi32 too_low       = reconstructed < INT16_MIN;
+      reconstructed             = (reconstructed & ~too_low) | (INT16_MIN & too_low);
+      qoamax_vi32 too_high      = reconstructed > INT16_MAX;
+      reconstructed             = (reconstructed & ~too_high) | (INT16_MAX & too_high);
+
+      qoamax_vi32 diff      = sample - reconstructed;
+      qoamax_vi32 new_error = (qoamax_vi32)((qoamax_vu32)error_low + (qoamax_vu32)diff * (qoamax_vu32)diff);
+      error_high -= new_error < error_low; // carry (the comparison yields -1)
+      error_low = new_error;
+
+      qoamax_vi32 delta = dequantized >> 4;
+      qoamax_vi32 sign0 = h0 >> 31, sign1 = h1 >> 31, sign2 = h2 >> 31, sign3 = h3 >> 31;
+      w0 += (delta ^ sign0) - sign0;
+      w1 += (delta ^ sign1) - sign1;
+      w2 += (delta ^ sign2) - sign2;
+      w3 += (delta ^ sign3) - sign3;
+      h0 = h1, h1 = h2, h2 = h3, h3 = reconstructed;
+    }
+
+    // Keep the better candidate of each stream (the lower scalefactor if both are equal) in both of its lanes.
+    qoamax_vi32 other_high, other_low;
+    qoamax_lanes_swap_pairs(&other_high, error_high), qoamax_lanes_swap_pairs(&other_low, error_low);
+    qoamax_vi32 same_high = other_high == error_high;
+    qoamax_vi32 take      = (other_high < error_high) | (same_high & (other_low < error_low)) |
+                            (same_high & (other_low == error_low) & odd);
+    scalefactor           = estimate - odd;
+    qoamax_vi32 *state[]  = {&error_high, &error_low, &h0, &h1,         &h2,        &h3,         &w0,
+                             &w1,         &w2,        &w3, &quant_high, &quant_low, &scalefactor};
+    for (size_t k = 0; k < sizeof state / sizeof state[0]; k++) qoamax_lanes_take_pair(state[k], take);
+
+    // The first 10 residuals are in quant_high, the others in quant_low.
+    for (int u = 0; u < count; u++) {
+      uint64_t slice =
+          (uint64_t)scalefactor[2 * u] << 60 | (uint64_t)(uint32_t)quant_high[2 * u] << 30 | (uint32_t)quant_low[2 * u];
+      qoamax__stream_put(&streams[u], slice, 20);
+    }
+  }
+
+  for (int u = 0; u < count; u++) {
+    qoamax_encoder_channel *state = &streams[u].state;
+    int lane                      = 2 * u;
+    state->error +=
+        (uint64_t)((uint32_t)error_high[lane] ^ 0x80000000) << 32 | ((uint32_t)error_low[lane] ^ 0x80000000);
+    state->prev_scalefactor = scalefactor[lane];
+    state->lms.history[0] = h0[lane], state->lms.history[1] = h1[lane];
+    state->lms.history[2] = h2[lane], state->lms.history[3] = h3[lane];
+    state->lms.weights[0] = w0[lane], state->lms.weights[1] = w1[lane];
+    state->lms.weights[2] = w2[lane], state->lms.weights[3] = w3[lane];
+  }
+}
+
+//! Decodes slice_count full slices (20 samples each) of up to QOAMAX_VARIANT_LANES streams at once, one stream per
+//! lane, with the same results as @ref qoamax_decode_slice.
+QOAMAX_VARIANT_TARGET
+static void qoamax_decode_lanes(qoamax__stream *restrict streams, int count, int slice_count) {
+  constexpr int lanes = QOAMAX_VARIANT_LANES;
+  qoamax_assume(count >= 1 && count <= lanes);
+
+  // The LMS states by lane (unused lanes are zero). They stay in vectors until the last slice.
+  int32_t lms[8][lanes];
+  if (count < lanes) memset(lms, 0, sizeof lms);
+  for (int l = 0; l < count; l++)
+    for (int k = 0; k < 4; k++)
+      lms[k][l] = streams[l].state.lms.history[k], lms[4 + k][l] = streams[l].state.lms.weights[k];
+  qoamax_vi32 h0, h1, h2, h3, w0, w1, w2, w3;
+  memcpy(&h0, lms[0], sizeof h0), memcpy(&h1, lms[1], sizeof h1), memcpy(&h2, lms[2], sizeof h2);
+  memcpy(&h3, lms[3], sizeof h3), memcpy(&w0, lms[4], sizeof w0), memcpy(&w1, lms[5], sizeof w1);
+  memcpy(&w2, lms[6], sizeof w2), memcpy(&w3, lms[7], sizeof w3);
+  // The signs of the history (0 or -1), which select the direction of the weight updates.
+  qoamax_vi32 s0 = h0 >> 31, s1 = h1 >> 31, s2 = h2 >> 31, s3 = h3 >> 31;
+
+  for (int s = 0; s < slice_count; s++) {
+    // Per lane: the slice's residuals in two halves of 30 bits (first residual at the top), and the dequantization
+    // columns of its scalefactor (see qoamax_lanes_dqt).
+    uint32_t slices[2][lanes];
+    int32_t columns[4][lanes];
+    if (count < lanes) memset(slices, 0, sizeof slices), memset(columns, 0, sizeof columns);
+    for (int l = 0; l < count; l++) {
+      uint64_t slice = qoamax__stream_get(&streams[l]);
+      slices[0][l]   = (uint32_t)(slice >> 30) << 2;
+      slices[1][l]   = (uint32_t)slice << 2;
+      for (int k = 0; k < 4; k++) columns[k][l] = qoamax_lanes_dqt[k][slice >> 60];
+    }
+    qoamax_vu32 residuals;
+    qoamax_vi32 d0, d1, d2, d3;
+    memcpy(&residuals, slices[0], sizeof residuals);
+    memcpy(&d0, columns[0], sizeof d0), memcpy(&d1, columns[1], sizeof d1);
+    memcpy(&d2, columns[2], sizeof d2), memcpy(&d3, columns[3], sizeof d3);
+
+    int32_t out[20][lanes];
+    QOAMAX_PRAGMA(GCC unroll 5)
+    for (int i = 0; i < 20; i++) {
+      if (i == 10) memcpy(&residuals, slices[1], sizeof residuals);
+      // The dequantized residual: {a, -a, b, -b, ...}[quant], with the magnitude d0 + d1 + ... (up to quant / 2).
+      qoamax_vi32 quant    = (qoamax_vi32)(residuals >> 29);
+      qoamax_vi32 negative = -(quant & 1);
+      residuals <<= 3;
+      qoamax_vi32 magnitude   = d0 + ((quant > 1) & d1) + ((quant > 3) & d2) + ((quant > 5) & d3);
+      qoamax_vi32 dequantized = (magnitude ^ negative) - negative;
+
+      // Unsigned to keep overflow defined; the result is the same as in the scalar code.
+      qoamax_vu32 sum      = (qoamax_vu32)w0 * (qoamax_vu32)h0 + (qoamax_vu32)w1 * (qoamax_vu32)h1 +
+                             (qoamax_vu32)w2 * (qoamax_vu32)h2 + (qoamax_vu32)w3 * (qoamax_vu32)h3;
+      qoamax_vi32 sample   = ((qoamax_vi32)sum >> 13) + dequantized;
+      qoamax_vi32 too_low  = sample < INT16_MIN;
+      sample               = (sample & ~too_low) | (INT16_MIN & too_low);
+      qoamax_vi32 too_high = sample > INT16_MAX;
+      sample               = (sample & ~too_high) | (INT16_MAX & too_high);
+
+      qoamax_vi32 delta = dequantized >> 4;
+      w0 += (delta ^ s0) - s0;
+      w1 += (delta ^ s1) - s1;
+      w2 += (delta ^ s2) - s2;
+      w3 += (delta ^ s3) - s3;
+      h0 = h1, h1 = h2, h2 = h3, h3 = sample;
+      s0 = s1, s1 = s2, s2 = s3, s3 = sample >> 31;
+      memcpy(out[i], &sample, sizeof sample);
+    }
+
+    for (int l = 0; l < count; l++) {
+      qoamax__stream *stream = &streams[l];
+      for (int i = 0; i < 20; i++) stream->samples[i * stream->sample_stride] = (int16_t)out[i][l];
+      qoamax__stream_next(stream, 20);
+    }
+  }
+
+  for (int l = 0; l < count; l++) {
+    qoamax_lms *state = &streams[l].state.lms;
+    state->history[0] = h0[l], state->history[1] = h1[l], state->history[2] = h2[l], state->history[3] = h3[l];
+    state->weights[0] = w0[l], state->weights[1] = w1[l], state->weights[2] = w2[l], state->weights[3] = w3[l];
+  }
+}
+
+//! The functions of this variant, see @ref qoamax__simd_get.
+static const qoamax__simd qoamax_simd = {
+    .lanes            = QOAMAX_VARIANT_LANES,
+    .search           = qoamax_encode_slice__hillclimb_scalefactor_search_lanes,
+    .search_unclamped = qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped,
+    .encode_ultrafast = qoamax_encode_ultrafast_lanes,
+    .decode           = qoamax_decode_lanes,
+};
 
 // End of the variant (see above).
 #undef qoamax_vi32
 #undef qoamax_vu32
+#undef qoamax_vu64
+#undef qoamax_lanes_swap_pairs
+#undef qoamax_lanes_take_pair
 #undef qoamax_lanes_table
 #undef qoamax_lanes_state
 #undef qoamax_hillclimb_lanes_step
@@ -367,7 +620,9 @@ static uint64_t qoamax_encode_slice__ultrafast_lanes(qoamax_lms *lms, int prev_s
 #undef qoamax_encode_slice__hillclimb_scalefactor_search_lanes_impl
 #undef qoamax_encode_slice__hillclimb_scalefactor_search_lanes
 #undef qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped
-#undef qoamax_encode_slice__ultrafast_lanes
+#undef qoamax_encode_ultrafast_lanes
+#undef qoamax_decode_lanes
+#undef qoamax_simd
 #undef QOAMAX_VARIANT_LANES
 #undef QOAMAX_VARIANT_SUFFIX
 #undef QOAMAX_VARIANT_TARGET

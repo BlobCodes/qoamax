@@ -102,6 +102,10 @@ FRAMES=12000 # 2 channels, 44100 Hz (wavgen's samplerate)
 
 expect_ok "help" "$Q" --help
 grep -q "Usage:" stdout || fail "help: no usage on stdout"
+expect_ok "version" "$Q" -v
+grep -qx "qoamax [0-9]*\.[0-9]*\.[0-9]*" stdout || fail "version: no version on stdout"
+expect_ok "long version" "$Q" --version
+grep -qx "qoamax [0-9]*\.[0-9]*\.[0-9]*" stdout || fail "long version: no version on stdout"
 expect_ok "encode help" "$Q" encode -h
 grep -q -- "--effort" stdout || fail "encode help: no --effort"
 expect_ok "decode help" "$Q" decode --help

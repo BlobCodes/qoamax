@@ -7,10 +7,10 @@ The library can be used stand-alone without any dependencies or even memory allo
 and compiles with any C23 compiler, including cproc. With gcc or clang it also uses SIMD
 (see [Compiler support](#compiler-support)).
 
-QOAMAX features an optimized decoder implementation tuned for various SIMD extensions (2.5x on a Ryzen 5900X).
+QOAMAX features an optimized decoder implementation tuned for various SIMD extensions (10x on a Ryzen 5900X).
 
 QOAMAX implements multiple parametrizable, optimized encoders, from highly performant to high-quality.  
-On average over 9 audio files (various music genres, sfx), the tradeoff currently looks like this (Ryzen 5900X, placebo and ultrafast missing):  
+On average over 9 audio files (various music genres, sfx), the tradeoff currently looks like this (Ryzen 5900X, placebo missing):  
 ![Graph showing the speed-quality tradeoff](assets/qoa_pareto.svg)
 
 ## Compilation
@@ -67,6 +67,31 @@ and the header `src/qoamax.h`, which is plain C11/C++11,
 so the rest of your project can use any compiler and standard from those on.
 Build the library with optimizations: the encoder is many times slower without them.
 
+The API (documented in `src/qoamax.h`, see `test/example.c` for a complete program) has two levels:
+
+- **QOA files:** `qoamax_encoder_init` and `qoamax_encoder_write` (or `_write_interleaved`) encode into a QOA file,
+  `qoamax_decoder_init` and `qoamax_decoder_read` (or `_read_interleaved`) decode one. They work on buffers of any
+  size and report their progress by advancing your pointers, so they can stream.
+- **Streams of slices** for your own container or streaming format: `qoamax_encode_streams` encodes many independent
+  streams (e.g. the channels of a track) into 64-bit slices (one per 20 samples), and `qoamax_decode_streams`
+  decodes them. They encode or decode several streams at once in SIMD lanes, which is much faster than one by one
+  (`qoamax_encode_slice` and `qoamax_decode_slice` handle a single slice).
+
+```c
+// Encode n samples per channel of interleaved stereo audio into one array of slices per channel...
+size_t slice_count = (n + 19) / 20;
+qoamax_encode_stream encode[2];
+for (int ch = 0; ch < 2; ch++)
+  encode[ch] = qoamax_encode_stream_init(&samples[ch], n, 2, slices[ch], slice_count);
+qoamax_encode_streams(QOAMAX_ENCODER_EFFORT_ULTRAFAST, 2, encode, true);
+
+// ...and decode them again.
+qoamax_decode_stream decode[2];
+for (int ch = 0; ch < 2; ch++)
+  decode[ch] = qoamax_decode_stream_init(slices[ch], slice_count, &decoded[ch], n, 2);
+qoamax_decode_streams(2, decode);
+```
+
 **Copy the source** into your project: `src/qoamax.h`, `src/qoamax_plain.h` (plain declarations for C++ and C
 compilers without VLA parameters, included by `qoamax.h`), `src/qoamax.c`, `src/qoamax_lanes.h` and
 `src/qoamax_beam.h`. Compile `qoamax.c` as its own file, with
@@ -102,7 +127,7 @@ Then `dependency('qoamax')` finds it, installed or as a subproject. The CLI isn'
 symbols from a DLL.
 
 **Installed** (by `make install`, CMake or Meson): `pkg-config --cflags --libs qoamax`.
-Before version 1.0, every minor version may change the ABI (the shared library's soname is `libqoamax.so.0.1`).
+Before version 1.0, every minor version may change the ABI (the shared library's soname is `libqoamax.so.0.2`).
 
 ## Compiler support
 

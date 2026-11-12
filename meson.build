@@ -4,7 +4,7 @@
 project(
   'qoamax',
   'c',
-  version: '0.1.1', # Keep in sync with QOAMAX_VERSION_* in src/qoamax.h (checked by make test-build-systems).
+  version: '0.2.0', # Keep in sync with QOAMAX_VERSION_* in src/qoamax.h (checked by make test-build-systems).
   license: 'EUPL-1.2',
   license_files: 'LICENSE.md',
   meson_version: '>=1.4.0', # c_std=c23
@@ -24,7 +24,7 @@ qoamax_lib = library(
   c_args: qoamax_c_args,
   override_options: ['c_std=c23'],
   version: meson.project_version(),
-  soversion: '0.1', # Before 1.0, a minor version may change the ABI.
+  soversion: '0.2', # Before 1.0, a minor version may change the ABI.
   install: true,
 )
 install_headers('src/qoamax.h', 'src/qoamax_plain.h')

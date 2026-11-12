@@ -218,6 +218,73 @@ static void qoamax_decode_slice__interleaved(qoamax_lms *restrict lms, uint64_t 
 //! The encoder searches scalefactors outward from the previous slice's one, as it usually is close to the best one.
 static inline int qoamax_outward(int center, int rank) { return center + ((rank >> 1) ^ -(rank & 1)); }
 
+//! Reads a big-endian 64-bit word and advances *data past it.
+static inline uint64_t qoamax__read_u64be(const char *restrict *restrict data) {
+  uint64_t value = 0;
+  for (int i = 0; i < 8; i++) value = (value << 8) | (uint8_t)(*data)[i];
+  *data += 8;
+  return value;
+}
+
+//! Writes a big-endian 64-bit word and advances *out past it.
+static inline void qoamax__write_u64be(char *restrict *restrict out, uint64_t value) {
+  for (int i = 0; i < 8; i++) (*out)[i] = (char)(value >> (56 - 8 * i));
+  *out += 8;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+//                                  Streams                                  //
+///////////////////////////////////////////////////////////////////////////////
+
+// The encoder and decoder work on streams: independent sequences of slices, e.g. a channel of the current frame, or
+// (as every frame header stores the LMS state) a channel of one of several frames, or the streams of the public
+// qoamax_encode_streams / qoamax_decode_streams. Independent streams are encoded or decoded in parallel
+// (qoamax__encode_streams, qoamax__decode_streams), which only the file format code and the public API set up.
+
+//! An independent sequence of slices and their samples.
+typedef struct {
+  qoamax_encoder_channel state; //!< The LMS state (the decoder uses only this), the error and the last scalefactor
+  char *slices;                 //!< The next slice (the decoder only reads it)
+  int slice_step;               //!< Bytes from one slice to the next
+  bool big_endian;              //!< Whether the slices are big-endian words (the file format) or uint64_t values
+  int sample_stride;            //!< Sample i is samples[i * sample_stride]
+  int16_t *samples;             //!< The next sample (the encoder only reads it)
+  size_t samples_size;          //!< Samples from `samples` on: the end of the stream, and the encoder's lookahead
+  size_t slice_count;           //!< The number of slices left to encode or decode
+} qoamax__stream;
+
+//! Returns the stream's next slice.
+static inline uint64_t qoamax__stream_get(const qoamax__stream *stream) {
+  const char *slice = stream->slices;
+  if (stream->big_endian) return qoamax__read_u64be(&slice);
+  uint64_t value;
+  memcpy(&value, slice, sizeof value);
+  return value;
+}
+
+//! Advances the stream past a slice of samples_count samples.
+static inline void qoamax__stream_next(qoamax__stream *stream, int samples_count) {
+  stream->slices += stream->slice_step;
+  stream->samples += samples_count * stream->sample_stride;
+  stream->samples_size -= samples_count;
+  stream->slice_count -= 1;
+}
+
+//! Stores the stream's next slice, which encodes samples_count samples, and advances the stream past it.
+static inline void qoamax__stream_put(qoamax__stream *stream, uint64_t slice, int samples_count) {
+  char *out = stream->slices;
+  if (stream->big_endian)
+    qoamax__write_u64be(&out, slice);
+  else
+    memcpy(out, &slice, sizeof slice);
+  qoamax__stream_next(stream, samples_count);
+}
+
+//! Returns the number of full slices (20 samples) the stream has left to encode or decode.
+static inline size_t qoamax__stream_full_slices(const qoamax__stream *stream) {
+  return QOAMAX_MIN(stream->slice_count, stream->samples_size / 20);
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 //                        Hillclimb Encoding Algorithm                       //
 ///////////////////////////////////////////////////////////////////////////////
@@ -312,6 +379,39 @@ static uint64_t qoamax_encode_hillclimb_search_unclamped(qoamax_lms lms[static r
   qoamax_assume(samples_count < 20);
   return qoamax_encode_hillclimb_search_impl(lms, samples_count, samples, scalefactor, error_hint, slice_out, true);
 }
+
+///////////////////////////////////////////////////////////////////////////////
+//                         Ultrafast Encoding Algorithm                      //
+///////////////////////////////////////////////////////////////////////////////
+
+// ULTRAFAST doesn't search the scalefactor. It estimates it from the largest residual of an open-loop prediction (from
+// the input samples instead of the reconstructed ones, so without a dependency chain), and runs the hill-climb for the
+// estimate and the next larger scalefactor. The SIMD version encodes several streams (channels, possibly of different
+// frames) at once, one lane per stream and scalefactor.
+//
+// The hill-climb is a chain of dependent operations (about 17 vector operations per sample), so one slice per call
+// would leave the lanes mostly idle: SUPERFAST runs 16 scalefactors in barely more time than one. To have enough
+// independent work, the stream encoder encodes up to QOAMAX_ULTRAFAST_GROUP_FRAMES frames at once (see
+// qoamax_encoder_write__impl). The frames of a group start from the four input samples before them and the LMS
+// weights at the end of the previous group, instead of the state where the previous frame ended (every frame header
+// holds the state the decoder starts from). The weights change slowly with the signal's spectrum, and this costs about
+// 0.05 dB (resetting the weights to their initial values would cost 0.7 dB). The first group's frames are encoded one
+// after another.
+//
+// Measured (2026-11, Ryzen 5900X, clang 23, AVX2 by dispatch, 9 music and sound effect samples): SUPERFAST 48.94 dB at
+// 85 M samples/s, ULTRAFAST 48.30 dB at 316 M samples/s (the decoder: 380). The old ULTRAFAST (the hill-climb with the
+// previous scalefactor -1 and +1) had 40.54 dB at 112 M samples/s. With 1 or 4 candidates instead of 2, ULTRAFAST
+// would be about 1.6 dB worse at 1.6x the speed, or 0.6 dB better at 0.6x.
+
+//! Frames per group of ULTRAFAST (the output depends on it). 4 fill AVX2 vectors (4 streams) for mono.
+#define QOAMAX_ULTRAFAST_GROUP_FRAMES 4
+
+//! The estimated scalefactor is the number of thresholds the largest open-loop residual exceeds. Threshold s - 1 is
+//! 7.5 times the geometric mean of the scales of scalefactors s - 1 and s (the dequantization steps are 0.75, 2.5, 4.5
+//! and 7 times the scale (s + 1)^2.75): floor(7.5 * sqrt(s^2.75 * (s + 1)^2.75)). There is no threshold for 15, as the
+//! next larger scalefactor is tried as well. The factor was tuned on music samples.
+static const int32_t qoamax_ultrafast_thresholds[14] = {19,   88,   228,  461,  805,  1279, 1900,
+                                                        2684, 3648, 4808, 6178, 7773, 9608, 11698};
 
 ///////////////////////////////////////////////////////////////////////////////
 //                      Hillclimb Scalefactor Search                         //
@@ -487,6 +587,20 @@ static int qoamax__lanes_supported(void) {
 #define QOAMAX_HAS_VARIANTS
 #endif
 
+//! The functions of a SIMD variant (qoamax_lanes.h defines one table per variant, qoamax__simd_get chooses one).
+typedef struct {
+  int lanes;
+  //! See @ref qoamax_encode_slice__hillclimb_scalefactor_search_scalar_impl (normal and unclamped variant).
+  uint64_t (*search)(qoamax_lms *lms, int first_scalefactor, int lookahead, const int16_t *samples, uint64_t error_hint,
+                     uint64_t *out_slice, uint64_t *out_error);
+  uint64_t (*search_unclamped)(qoamax_lms *lms, int first_scalefactor, int lookahead, const int16_t *samples,
+                               uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error);
+  //! ULTRAFAST for full slices of up to lanes / 2 streams, see @ref qoamax_encode_ultrafast_scalar.
+  void (*encode_ultrafast)(qoamax__stream *streams, int count, int slice_count);
+  //! Decodes full slices of up to `lanes` streams.
+  void (*decode)(qoamax__stream *streams, int count, int slice_count);
+} qoamax__simd;
+
 // Pastes QOAMAX_VARIANT_SUFFIX to a name defined in qoamax_lanes.h or qoamax_beam.h.
 #define QOAMAX_VARIANT_NAME(name) QOAMAX_VARIANT_NAME_(name, QOAMAX_VARIANT_SUFFIX)
 #define QOAMAX_VARIANT_NAME_(name, suffix) QOAMAX_VARIANT_NAME__(name, suffix)
@@ -569,6 +683,31 @@ static inline uint64_t qoamax_scalefactor_results_get(const qoamax_scalefactor_r
 
 #endif
 
+//! Returns the functions of the widest SIMD variant the CPU supports, or null without SIMD.
+static const qoamax__simd *qoamax__simd_get(void) {
+#ifdef QOAMAX_HAS_VARIANTS
+  switch (qoamax__lanes_supported()) {
+#ifdef QOAMAX_TARGET_X16
+  case 16:
+    return &qoamax_simd__x16;
+#endif
+#ifdef QOAMAX_TARGET_X8
+  case 8:
+    return &qoamax_simd__x8;
+#endif
+#ifdef QOAMAX_TARGET_X4
+  case 4:
+    return &qoamax_simd__x4;
+#endif
+  }
+#endif
+#if QOAMAX_LANES > 1
+  return &qoamax_simd;
+#else
+  return NULL; // not nullptr: cproc (as of 2026-11) crashes on returning nullptr as a pointer
+#endif
+}
+
 //! The scalefactor search of SUPERFAST/VERYFAST, using the widest SIMD variant the CPU supports (or the scalar search).
 //! See @ref qoamax_encode_slice__hillclimb_scalefactor_search_scalar_impl.
 // The dispatchers aren't inlined: inlined into qoamax_encode_slice, they made ULTRAFAST execute 1.5% more instructions.
@@ -577,32 +716,10 @@ static uint64_t qoamax_encode_slice__hillclimb_scalefactor_search(qoamax_lms *lm
                                                                   const int16_t samples[static restrict lookahead],
                                                                   uint64_t error_hint, uint64_t *out_slice,
                                                                   uint64_t *out_error) {
-#ifdef QOAMAX_HAS_VARIANTS
-  switch (qoamax__lanes_supported()) {
-#ifdef QOAMAX_TARGET_X16
-  case 16:
-    return qoamax_encode_slice__hillclimb_scalefactor_search_lanes__x16(lms, first_scalefactor, lookahead, samples,
-                                                                        error_hint, out_slice, out_error);
-#endif
-#ifdef QOAMAX_TARGET_X8
-  case 8:
-    return qoamax_encode_slice__hillclimb_scalefactor_search_lanes__x8(lms, first_scalefactor, lookahead, samples,
-                                                                       error_hint, out_slice, out_error);
-#endif
-#ifdef QOAMAX_TARGET_X4
-  case 4:
-    return qoamax_encode_slice__hillclimb_scalefactor_search_lanes__x4(lms, first_scalefactor, lookahead, samples,
-                                                                       error_hint, out_slice, out_error);
-#endif
-  }
-#endif
-#if QOAMAX_LANES > 1
-  return qoamax_encode_slice__hillclimb_scalefactor_search_lanes(lms, first_scalefactor, lookahead, samples, error_hint,
-                                                                 out_slice, out_error);
-#else
+  const qoamax__simd *simd = qoamax__simd_get();
+  if (simd) return simd->search(lms, first_scalefactor, lookahead, samples, error_hint, out_slice, out_error);
   return qoamax_encode_slice__hillclimb_scalefactor_search_scalar(lms, first_scalefactor, lookahead, samples,
                                                                   error_hint, out_slice, out_error);
-#endif
 }
 
 //! See @ref qoamax_encode_slice__hillclimb_scalefactor_search (unclamped variant, the beam search's error bound).
@@ -610,32 +727,10 @@ static uint64_t qoamax_encode_slice__hillclimb_scalefactor_search(qoamax_lms *lm
 static uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_unclamped(
     qoamax_lms *lms, int first_scalefactor, int lookahead, const int16_t samples[static restrict lookahead],
     uint64_t error_hint, uint64_t *out_slice, uint64_t *out_error) {
-#ifdef QOAMAX_HAS_VARIANTS
-  switch (qoamax__lanes_supported()) {
-#ifdef QOAMAX_TARGET_X16
-  case 16:
-    return qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped__x16(
-        lms, first_scalefactor, lookahead, samples, error_hint, out_slice, out_error);
-#endif
-#ifdef QOAMAX_TARGET_X8
-  case 8:
-    return qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped__x8(
-        lms, first_scalefactor, lookahead, samples, error_hint, out_slice, out_error);
-#endif
-#ifdef QOAMAX_TARGET_X4
-  case 4:
-    return qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped__x4(
-        lms, first_scalefactor, lookahead, samples, error_hint, out_slice, out_error);
-#endif
-  }
-#endif
-#if QOAMAX_LANES > 1
-  return qoamax_encode_slice__hillclimb_scalefactor_search_lanes_unclamped(lms, first_scalefactor, lookahead, samples,
-                                                                           error_hint, out_slice, out_error);
-#else
+  const qoamax__simd *simd = qoamax__simd_get();
+  if (simd) return simd->search_unclamped(lms, first_scalefactor, lookahead, samples, error_hint, out_slice, out_error);
   return qoamax_encode_slice__hillclimb_scalefactor_search_scalar_unclamped(lms, first_scalefactor, lookahead, samples,
                                                                             error_hint, out_slice, out_error);
-#endif
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -921,75 +1016,101 @@ static inline int qoamax_encode_beam_search_impl(const qoamax_beam_node *restric
 //                               Final Encoder                               //
 ///////////////////////////////////////////////////////////////////////////////
 
-//! ULTRAFAST without SIMD: hill-climb with the two scalefactors next to the previous one.
-static uint64_t qoamax_encode_slice__ultrafast_scalar(qoamax_lms *lms, int prev_scalefactor, int samples_count,
-                                                      const int16_t samples[static restrict samples_count],
-                                                      uint64_t *out_error) {
-  uint64_t best_slice = 0;
-  uint64_t best_error = -1;
-  qoamax_lms best_lms = *lms;
+//! Returns the scalefactor ULTRAFAST estimates for the samples: the number of thresholds the largest residual of the
+//! prediction from the input samples (with the LMS weights, which aren't updated) exceeds.
+static int qoamax_ultrafast_estimate(const qoamax_lms *lms, int samples_count, const int16_t samples[samples_count]) {
+  const int32_t *weights = lms->weights;
+  int32_t x0 = lms->history[0], x1 = lms->history[1], x2 = lms->history[2], x3 = lms->history[3];
+  int32_t max_residual = 0;
+  for (int i = 0; i < samples_count; i++) {
+    uint32_t sum     = (uint32_t)weights[0] * (uint32_t)x0 + (uint32_t)weights[1] * (uint32_t)x1 +
+                       (uint32_t)weights[2] * (uint32_t)x2 + (uint32_t)weights[3] * (uint32_t)x3;
+    int32_t residual = samples[i] - ((int32_t)sum >> 13);
+    int32_t abs      = residual < 0 ? -residual : residual;
+    max_residual     = QOAMAX_MAX(max_residual, abs);
+    x0 = x1, x1 = x2, x2 = x3, x3 = samples[i];
+  }
 
-  // A loop rather than two calls, so the compiler doesn't duplicate the (inlined) hill-climb.
-  for (int offset = -1; offset <= 1; offset += 2) {
-    int scalefactor = (prev_scalefactor + offset) & 15;
+  int estimate = 0;
+  for (int k = 0; k < 14; k++) estimate += max_residual > qoamax_ultrafast_thresholds[k];
+  return estimate;
+}
 
-    qoamax_lms local_lms = *lms;
-    uint64_t slice;
-    uint64_t error =
-        qoamax_encode_hillclimb_search(&local_lms, samples_count, samples, scalefactor, best_error, &slice);
-    if (error < best_error) {
-      best_error = error;
-      best_slice = slice;
-      best_lms   = local_lms;
+//! ULTRAFAST without SIMD: encodes the stream's slices with the hill-climb, using the better of the estimated
+//! scalefactor and the next larger one (the estimated one if both are equal).
+static void qoamax_encode_ultrafast_scalar(qoamax__stream *stream) {
+  while (stream->slice_count > 0) {
+    int samples_count = (int)QOAMAX_MIN(stream->samples_size, 20);
+    int16_t samples[20];
+    for (int i = 0; i < samples_count; i++) samples[i] = stream->samples[i * stream->sample_stride];
+
+    int estimate        = qoamax_ultrafast_estimate(&stream->state.lms, samples_count, samples);
+    uint64_t best_error = UINT64_MAX, best_slice = 0;
+    qoamax_lms best_lms = stream->state.lms;
+    // A loop rather than two calls, so the compiler doesn't duplicate the (inlined) hill-climb.
+    for (int scalefactor = estimate; scalefactor <= estimate + 1; scalefactor++) {
+      qoamax_lms lms = stream->state.lms;
+      uint64_t slice;
+      uint64_t error = qoamax_encode_hillclimb_search(&lms, samples_count, samples, scalefactor, best_error, &slice);
+      if (error < best_error) best_error = error, best_lms = lms, best_slice = slice;
+    }
+
+    stream->state.lms = best_lms;
+    stream->state.error += best_error;
+    stream->state.prev_scalefactor = best_slice >> 60;
+    qoamax__stream_put(stream, best_slice, samples_count);
+  }
+}
+
+//! Processes the slices of every stream: the full slices with a SIMD kernel, which takes up to `per_call` streams at
+//! once and advances all of them by the same number of slices, while at least `min_count` streams have full slices
+//! left; everything else (partial slices, too few streams) one stream at a time with `scalar`, which gives the same
+//! results. The streams may have different lengths: the kernel's streams are refilled as they run out.
+static void qoamax__run_streams(qoamax__stream *streams, size_t count,
+                                void (*kernel)(qoamax__stream *streams, int count, int slice_count), int per_call,
+                                int min_count, void (*scalar)(qoamax__stream *stream)) {
+  qoamax__stream batch[16]; // copies of the streams in the kernel's lanes
+  size_t index[16];         // their positions in `streams`
+  int used    = 0;
+  size_t next = 0;
+  qoamax_assume(per_call <= 16);
+
+  while (kernel) {
+    for (; used < per_call && next < count; next++) {
+      if (qoamax__stream_full_slices(&streams[next]) == 0)
+        scalar(&streams[next]);
+      else
+        batch[used] = streams[next], index[used++] = next;
+    }
+    if (used < min_count) break;
+
+    // At most 65536 slices per call, so that ULTRAFAST's sums of errors (of 1.3 M samples) can't overflow.
+    size_t slices = 1 << 16;
+    for (int i = 0; i < used; i++) slices = QOAMAX_MIN(slices, qoamax__stream_full_slices(&batch[i]));
+    kernel(batch, used, (int)slices);
+
+    // Streams without full slices left make room for the next ones.
+    for (int i = 0; i < used;) {
+      if (qoamax__stream_full_slices(&batch[i]) > 0) {
+        i++;
+        continue;
+      }
+      streams[index[i]] = batch[i];
+      scalar(&streams[index[i]]);
+      used--, batch[i] = batch[used], index[i] = index[used];
     }
   }
 
-  *lms       = best_lms;
-  *out_error = best_error;
-  return best_slice;
+  for (int i = 0; i < used; i++) streams[index[i]] = batch[i], scalar(&streams[index[i]]);
+  for (; next < count; next++) scalar(&streams[next]);
 }
 
-//! ULTRAFAST: hill-climb with the scalefactors next to the previous one, using the widest SIMD variant the CPU
-//! supports (or the scalar version).
-static uint64_t qoamax_encode_slice__ultrafast(qoamax_encoder_channel *restrict channel, int samples_count,
-                                               const int16_t samples[static restrict samples_count]) {
-  qoamax_lms *lms = &channel->lms;
-  int prev        = channel->prev_scalefactor;
-  uint64_t slice, error;
-#ifdef QOAMAX_HAS_VARIANTS
-  int lanes = qoamax__lanes_supported();
-#else
-  int lanes = QOAMAX_LANES;
-#endif
-  switch (lanes) {
-#ifdef QOAMAX_TARGET_X16
-  case 16:
-    slice = qoamax_encode_slice__ultrafast_lanes__x16(lms, prev, samples_count, samples, &error);
-    break;
-#endif
-#ifdef QOAMAX_TARGET_X8
-  case 8:
-    slice = qoamax_encode_slice__ultrafast_lanes__x8(lms, prev, samples_count, samples, &error);
-    break;
-#endif
-#ifdef QOAMAX_TARGET_X4
-  case 4:
-    slice = qoamax_encode_slice__ultrafast_lanes__x4(lms, prev, samples_count, samples, &error);
-    break;
-#endif
-#if QOAMAX_LANES >= 4
-  case QOAMAX_LANES:
-    slice = qoamax_encode_slice__ultrafast_lanes(lms, prev, samples_count, samples, &error);
-    break;
-#endif
-  default:
-    slice = qoamax_encode_slice__ultrafast_scalar(lms, prev, samples_count, samples, &error);
-    break;
-  }
-
-  channel->prev_scalefactor = slice >> 60;
-  channel->error += error;
-  return slice;
+//! ULTRAFAST: encodes the slices of every stream, half as many streams at once as the widest SIMD variant the CPU
+//! supports has lanes.
+static void qoamax_encode_ultrafast(qoamax__stream *streams, size_t count) {
+  const qoamax__simd *simd = qoamax__simd_get();
+  qoamax__run_streams(streams, count, simd ? simd->encode_ultrafast : NULL, simd ? simd->lanes / 2 : 0, 1,
+                      qoamax_encode_ultrafast_scalar);
 }
 
 //! SUPERFAST, VERYFAST: hill-climb with the best scalefactors over the lookahead.
@@ -1046,34 +1167,172 @@ uint64_t qoamax_encode_slice(qoamax_encoder_channel *restrict channel, qoamax_en
   int lookahead  = QOAMAX_MIN(samples_size, qoamax_encoder_effort_get_lookahead(effort));
   int beam_width = effort >> 2;
 
-  if (effort < 0) return qoamax_encode_slice__ultrafast(channel, QOAMAX_MIN(samples_size, 20), samples);
+  if (effort < 0) {
+    uint64_t slice;
+    qoamax__stream stream = {.state         = *channel,
+                             .slices        = (char *)&slice,
+                             .slice_step    = 8,
+                             .sample_stride = 1,
+                             .samples       = (int16_t *)samples, // only read
+                             .samples_size  = QOAMAX_MIN(samples_size, 20),
+                             .slice_count   = 1};
+    qoamax_encode_ultrafast(&stream, 1);
+    *channel = stream.state;
+    return slice;
+  }
   if (beam_width == 0) return qoamax_encode_slice__hillclimb(channel, lookahead, samples);
   return qoamax_encode_slice__beam(channel, beam_width, lookahead, samples);
+}
+
+//! Encodes the slices of every stream (samples_size must hold the lookahead of every slice, unless the stream ends).
+//! ULTRAFAST encodes the streams in parallel.
+static void qoamax__encode_streams(qoamax_encoder_effort effort, qoamax__stream *streams, size_t count) {
+  if (effort < 0) {
+    qoamax_encode_ultrafast(streams, count);
+    return;
+  }
+
+  for (size_t j = 0; j < count; j++) {
+    qoamax__stream *stream = &streams[j];
+    while (stream->slice_count > 0) {
+      int samples_size = (int)QOAMAX_MIN(stream->samples_size, (size_t)qoamax_encoder_effort_get_lookahead(effort));
+      const int16_t *samples = stream->samples;
+      int16_t gathered[QOAMAX_MAX_LOOKAHEAD_SLICES * 20];
+      if (stream->sample_stride != 1) {
+        for (int i = 0; i < samples_size; i++) gathered[i] = samples[i * stream->sample_stride];
+        samples = gathered;
+      }
+      uint64_t slice = qoamax_encode_slice(&stream->state, effort, samples_size, samples);
+      qoamax__stream_put(stream, slice, QOAMAX_MIN(samples_size, 20));
+    }
+  }
+}
+
+//! Decodes the stream's slices without SIMD (the last one may end before the slice, see samples_size).
+static void qoamax__decode_stream_scalar(qoamax__stream *stream) {
+  int stride = stream->sample_stride;
+  while (stream->slice_count > 0) {
+    int samples_count = (int)QOAMAX_MIN(stream->samples_size, 20);
+    uint64_t slice    = qoamax__stream_get(stream);
+    if (samples_count < 20) {
+      // Decode a partial slice into a temporary buffer, so as not to write out of bounds.
+      int16_t decoded[20];
+      qoamax_decode_slice(&stream->state.lms, slice, decoded);
+      for (int i = 0; i < samples_count; i++) stream->samples[i * stride] = decoded[i];
+    } else if (stride == 1) {
+      qoamax_decode_slice(&stream->state.lms, slice, stream->samples);
+    } else {
+      qoamax_decode_slice__interleaved(&stream->state.lms, slice, stream->samples, stride);
+    }
+    qoamax__stream_next(stream, samples_count);
+  }
+}
+
+//! Decodes the slices of every stream. Full slices are decoded in SIMD lanes, one stream per lane, using the widest
+//! variant the CPU supports, while at least half of the lanes and 4 streams are in use: with fewer, the lanes are
+//! slower than the scalar decoder (which the CPU runs for several streams in parallel too).
+static void qoamax__decode_streams(qoamax__stream *streams, size_t count) {
+  const qoamax__simd *simd = qoamax__simd_get();
+  qoamax__run_streams(streams, count, simd ? simd->decode : NULL, simd ? simd->lanes : 0,
+                      simd ? QOAMAX_MAX(simd->lanes / 2, 4) : 0, qoamax__decode_stream_scalar);
+}
+
+#define QOAMAX_API_STREAMS 32 //!< Streams of the public API converted at once (on the stack)
+
+void qoamax_encode_streams(qoamax_encoder_effort effort, size_t stream_count,
+                           qoamax_encode_stream streams[stream_count], bool samples_complete) {
+  size_t lookahead = qoamax_encoder_effort_get_lookahead(effort);
+  qoamax__stream internal[QOAMAX_API_STREAMS];
+
+  for (size_t first = 0; first < stream_count; first += QOAMAX_API_STREAMS) {
+    size_t count = QOAMAX_MIN(stream_count - first, QOAMAX_API_STREAMS);
+    for (size_t j = 0; j < count; j++) {
+      const qoamax_encode_stream *stream = &streams[first + j];
+      size_t size                        = stream->samples_size;
+      // Without the end of the stream, only slices with their whole lookahead.
+      size_t slices = samples_complete ? (size + 19) / 20 : size < lookahead ? 0 : (size - lookahead) / 20 + 1;
+      internal[j]   = (qoamax__stream){
+          .state         = stream->channel,
+          .slices        = (char *)stream->slices,
+          .slice_step    = 8,
+          .sample_stride = stream->sample_stride,
+          .samples       = (int16_t *)stream->samples, // only read
+          .samples_size  = size,
+          .slice_count   = QOAMAX_MIN(slices, stream->slices_size),
+      };
+    }
+
+    qoamax__encode_streams(effort, internal, count);
+
+    for (size_t j = 0; j < count; j++) {
+      qoamax_encode_stream *stream = &streams[first + j];
+      uint64_t *slices             = (uint64_t *)internal[j].slices;
+      stream->channel              = internal[j].state;
+      stream->samples              = internal[j].samples;
+      stream->samples_size         = internal[j].samples_size;
+      stream->slices_size -= slices - stream->slices;
+      stream->slices = slices;
+    }
+  }
+}
+
+void qoamax_decode_streams(size_t stream_count, qoamax_decode_stream streams[stream_count]) {
+  qoamax__stream internal[QOAMAX_API_STREAMS];
+
+  for (size_t first = 0; first < stream_count; first += QOAMAX_API_STREAMS) {
+    size_t count = QOAMAX_MIN(stream_count - first, QOAMAX_API_STREAMS);
+    for (size_t j = 0; j < count; j++) {
+      const qoamax_decode_stream *stream = &streams[first + j];
+      internal[j]                        = (qoamax__stream){
+          .state.lms     = stream->lms,
+          .slices        = (char *)stream->slices, // only read
+          .slice_step    = 8,
+          .sample_stride = stream->sample_stride,
+          .samples       = stream->samples,
+          .samples_size  = stream->samples_size,
+          .slice_count   = QOAMAX_MIN(stream->slices_size, (stream->samples_size + 19) / 20),
+      };
+    }
+
+    qoamax__decode_streams(internal, count);
+
+    for (size_t j = 0; j < count; j++) {
+      qoamax_decode_stream *stream = &streams[first + j];
+      const uint64_t *slices       = (const uint64_t *)internal[j].slices;
+      stream->lms                  = internal[j].state.lms;
+      stream->samples              = internal[j].samples;
+      stream->samples_size         = internal[j].samples_size;
+      stream->slices_size -= slices - stream->slices;
+      stream->slices = slices;
+    }
+  }
 }
 
 ///////////////////////////////////////////////////////////////////////////////
 //                                File Format                                //
 ///////////////////////////////////////////////////////////////////////////////
 
-#define QOAMAX_MAGIC 0x716F6166 //!< "qoaf"
-
-//! Reads a big-endian 64-bit word and advances *data past it.
-static inline uint64_t qoamax__read_u64be(const char *restrict *restrict data) {
-  uint64_t value = 0;
-  for (int i = 0; i < 8; i++) value = (value << 8) | (uint8_t)(*data)[i];
-  *data += 8;
-  return value;
-}
-
-//! Writes a big-endian 64-bit word and advances *out past it.
-static inline void qoamax__write_u64be(char *restrict *restrict out, uint64_t value) {
-  for (int i = 0; i < 8; i++) (*out)[i] = (char)(value >> (56 - 8 * i));
-  *out += 8;
-}
+#define QOAMAX_MAGIC 0x716F6166   //!< "qoaf"
+#define QOAMAX_DECODER_STREAMS 16 //!< Most streams (frames * channels) the decoder decodes at once (the widest SIMD)
 
 //! The size of a frame in bytes: the frame header, every channel's LMS state (history, weights) and the slices.
 static inline uint32_t qoamax__frame_size(int channel_count, int samples_per_channel) {
   return 8 * (1 + channel_count * (2 + (samples_per_channel + 19) / 20));
+}
+
+//! The streams of the slices of every channel in a frame, from the slice at `slices` and sample samples[ch] on (the
+//! state is left to the caller).
+static void qoamax__frame_streams(qoamax__stream *streams, int channel_count, char *slices, int16_t *const samples[],
+                                  int stride, size_t samples_size, size_t slice_count) {
+  for (int ch = 0; ch < channel_count; ch++) {
+    streams[ch].slices        = slices + 8 * ch;
+    streams[ch].slice_step    = 8 * channel_count;
+    streams[ch].big_endian    = true;
+    streams[ch].sample_stride = stride;
+    streams[ch].samples       = samples[ch];
+    streams[ch].samples_size  = samples_size;
+    streams[ch].slice_count   = slice_count;
+  }
 }
 
 typedef struct {
@@ -1092,7 +1351,10 @@ static inline qoamax_frame_header qoamax__parse_frame_header(uint64_t header) {
   };
 }
 
-static int qoamax_decoder_read_frame_header(qoamax_decoder *restrict self, const char *restrict *restrict file) {
+//! Reads a frame header and the LMS state of every channel that follows it (into lms[ch]).
+//! @returns the frame's sample count per channel, or an error code.
+static int qoamax_decoder_read_frame_header(const qoamax_decoder *restrict self, const char *restrict *restrict file,
+                                            qoamax_lms lms[restrict]) {
   qoamax_frame_header header = qoamax__parse_frame_header(qoamax__read_u64be(file));
   if (header.channel_count != self->channel_count) return QOAMAX_ERROR_SAMPLE_FORMAT_BREAK;
   if (header.samplerate != self->samplerate) return QOAMAX_ERROR_SAMPLE_FORMAT_BREAK;
@@ -1105,20 +1367,18 @@ static int qoamax_decoder_read_frame_header(qoamax_decoder *restrict self, const
   if (header.size != qoamax__frame_size(header.channel_count, header.samples_per_channel))
     return QOAMAX_ERROR_INVALID_FRAME_HEADER;
 
-  self->frame_samples = header.samples_per_channel;
-
   for (int ch = 0; ch < header.channel_count; ch++) {
     uint64_t history = qoamax__read_u64be(file);
     uint64_t weights = qoamax__read_u64be(file);
     for (int i = 0; i < 4; i++) {
-      self->lms[ch].history[i] = (int16_t)(history >> 48);
-      self->lms[ch].weights[i] = (int16_t)(weights >> 48);
+      lms[ch].history[i] = (int16_t)(history >> 48);
+      lms[ch].weights[i] = (int16_t)(weights >> 48);
       history <<= 16;
       weights <<= 16;
     }
   }
 
-  return 0;
+  return header.samples_per_channel;
 }
 
 int qoamax_decoder_init(qoamax_decoder *restrict self, size_t file_size, const char *restrict *restrict file,
@@ -1145,84 +1405,95 @@ int qoamax_decoder_init(qoamax_decoder *restrict self, size_t file_size, const c
   return 0;
 }
 
-//! Prepares decoding the next slice of every channel, reading a frame header first if necessary.
-//! @returns the slice's sample count per channel, 0 if the file or the output space runs out, or an error code.
-static int qoamax_decoder_begin_slice(qoamax_decoder *restrict self, const char *restrict *restrict file,
-                                      const char *file_end, size_t samples_per_channel) {
-  if (self->frame_samples == 0) {
-    if (file_end - *file < 8 * (1 + 2 * self->channel_count)) return 0;
+//! The decoder of @ref qoamax_decoder_read and @ref qoamax_decoder_read_interleaved: the samples of channel ch are
+//! written to samples[ch], one every `stride` (the pointers are advanced past them).
+static int qoamax_decoder_read__impl(qoamax_decoder *restrict self, size_t file_size,
+                                     const char *restrict *restrict file, size_t samples_per_channel,
+                                     int16_t *samples[], int stride) {
+  int channel_count = self->channel_count;
+  qoamax_assume(channel_count >= 1 && channel_count <= QOAMAX_MAX_CHANNEL_COUNT);
+  const char *file_end = *file + file_size;
 
-    int err = qoamax_decoder_read_frame_header(self, file);
-    if (err) return err;
+  while (true) {
+    if (self->frame_samples == 0) {
+      // The full frames that are complete in the file and fit into the output are decoded at once: as every frame
+      // header holds the LMS states, the channels of all frames are independent streams.
+      qoamax__stream streams[QOAMAX_DECODER_STREAMS];
+      int frames = 0, max_frames = QOAMAX_MAX(QOAMAX_DECODER_STREAMS / channel_count, 1);
+      const char *frame = *file;
+      size_t frame_size = qoamax__frame_size(channel_count, QOAMAX_FRAME_SAMPLES);
+      while (frames < max_frames && (size_t)(file_end - frame) >= frame_size &&
+             samples_per_channel >= (size_t)(frames + 1) * QOAMAX_FRAME_SAMPLES) {
+        qoamax_lms lms[QOAMAX_MAX_CHANNEL_COUNT];
+        const char *slices = frame;
+        // Other frames (the last one, invalid ones) are left to the frame-by-frame path below.
+        if (qoamax_decoder_read_frame_header(self, &slices, lms) != QOAMAX_FRAME_SAMPLES) break;
+
+        int16_t *frame_samples[QOAMAX_MAX_CHANNEL_COUNT];
+        for (int ch = 0; ch < channel_count; ch++)
+          frame_samples[ch] = samples[ch] + frames * QOAMAX_FRAME_SAMPLES * stride;
+        qoamax__stream *frame_streams = &streams[frames * channel_count];
+        qoamax__frame_streams(frame_streams, channel_count, (char *)slices, frame_samples, stride, QOAMAX_FRAME_SAMPLES,
+                              QOAMAX_FRAME_SAMPLES / 20); // only read
+        for (int ch = 0; ch < channel_count; ch++) frame_streams[ch].state.lms = lms[ch];
+        frame += frame_size, frames++;
+      }
+      if (frames > 0) {
+        qoamax__decode_streams(streams, frames * channel_count);
+        for (int ch = 0; ch < channel_count; ch++) samples[ch] += frames * QOAMAX_FRAME_SAMPLES * stride;
+        *file = frame;
+        samples_per_channel -= frames * QOAMAX_FRAME_SAMPLES;
+        continue;
+      }
+
+      if (file_end - *file < 8 * (1 + 2 * channel_count)) return 0;
+      // Start the frame only if the output has room for its first slice. Otherwise the next call would have to decode
+      // the whole frame slice by slice, instead of with the frames after it.
+      const char *header = *file;
+      int frame_samples  = qoamax_decoder_read_frame_header(self, &header, self->lms);
+      if (frame_samples < 0) {
+        *file += 8; // past the invalid header
+        return frame_samples;
+      }
+      if (samples_per_channel < (size_t)QOAMAX_MIN(frame_samples, 20)) return 0;
+      *file               = header;
+      self->frame_samples = frame_samples;
+    }
+
+    // As many slices of the current frame as the file holds and the output has room for (a partial slice only at
+    // the end of the frame).
+    size_t frame_slices = (self->frame_samples + 19) / 20;
+    size_t slices       = QOAMAX_MIN(frame_slices, (size_t)(file_end - *file) / (8 * channel_count));
+    slices = QOAMAX_MIN(slices, samples_per_channel >= self->frame_samples ? frame_slices : samples_per_channel / 20);
+    if (slices == 0) return 0;
+    size_t samples_count = QOAMAX_MIN(20 * slices, self->frame_samples);
+
+    qoamax__stream streams[QOAMAX_MAX_CHANNEL_COUNT];
+    qoamax__frame_streams(streams, channel_count, (char *)*file, samples, stride, samples_count, slices); // only read
+    for (int ch = 0; ch < channel_count; ch++) streams[ch].state.lms = self->lms[ch];
+    qoamax__decode_streams(streams, channel_count);
+    for (int ch = 0; ch < channel_count; ch++) self->lms[ch] = streams[ch].state.lms, samples[ch] = streams[ch].samples;
+
+    *file += 8 * channel_count * slices;
+    self->frame_samples -= samples_count;
+    samples_per_channel -= samples_count;
   }
-
-  int slice_size = QOAMAX_MIN(20, self->frame_samples);
-  if (file_end - *file < 8 * self->channel_count) return 0;
-  if (samples_per_channel < (size_t)slice_size) return 0;
-
-  self->frame_samples -= slice_size;
-  return slice_size;
 }
 
 int qoamax_decoder_read(qoamax_decoder *restrict self, size_t file_size, const char *restrict *restrict file,
                         size_t samples_per_channel, int16_t *restrict samples[static restrict self->channel_count]) {
-  qoamax_assume(self->channel_count >= 1 && self->channel_count <= QOAMAX_MAX_CHANNEL_COUNT);
-
-  const char *file_end = *file + file_size;
-
-  while (true) {
-    int slice_size = qoamax_decoder_begin_slice(self, file, file_end, samples_per_channel);
-    if (slice_size <= 0) return slice_size;
-
-    for (int ch = 0; ch < self->channel_count; ch++) {
-      uint64_t slice = qoamax__read_u64be(file);
-      if (samples_per_channel >= 20) {
-        qoamax_decode_slice(&self->lms[ch], slice, samples[ch]);
-      } else {
-        // Less than a full slice of space left: decode into a temporary buffer to not write out of bounds.
-        int16_t tmp[20];
-        qoamax_decode_slice(&self->lms[ch], slice, tmp);
-        memcpy(samples[ch], tmp, slice_size * sizeof(int16_t));
-      }
-      samples[ch] += slice_size;
-    }
-
-    samples_per_channel -= slice_size;
-  }
+  return qoamax_decoder_read__impl(self, file_size, file, samples_per_channel, (int16_t **)samples, 1);
 }
 
 int qoamax_decoder_read_interleaved(qoamax_decoder *restrict self, size_t file_size,
                                     const char *restrict *restrict file, size_t samples_size,
                                     int16_t *restrict samples[static restrict 1]) {
-  if (self->channel_count == 1) return qoamax_decoder_read(self, file_size, file, samples_size, samples);
-
-  qoamax_assume(self->channel_count >= 1 && self->channel_count <= QOAMAX_MAX_CHANNEL_COUNT);
-
-  const char *file_end       = *file + file_size;
-  size_t samples_per_channel = samples_size / self->channel_count;
-
-  while (true) {
-    int slice_size = qoamax_decoder_begin_slice(self, file, file_end, samples_per_channel);
-    if (slice_size <= 0) return slice_size;
-
-    if (slice_size == 20) {
-      // Full slices are decoded directly into the output.
-      for (int ch = 0; ch < self->channel_count; ch++)
-        qoamax_decode_slice__interleaved(&self->lms[ch], qoamax__read_u64be(file), &(*samples)[ch],
-                                         self->channel_count);
-      *samples += 20 * self->channel_count;
-    } else {
-      // The last slice of a frame may be shorter: decode it into a temporary buffer.
-      int16_t decoded[QOAMAX_MAX_CHANNEL_COUNT][20];
-      for (int ch = 0; ch < self->channel_count; ch++)
-        qoamax_decode_slice(&self->lms[ch], qoamax__read_u64be(file), decoded[ch]);
-
-      for (int i = 0; i < slice_size; i++)
-        for (int ch = 0; ch < self->channel_count; ch++) *(*samples)++ = decoded[ch][i];
-    }
-
-    samples_per_channel -= slice_size;
-  }
+  int16_t *channels[QOAMAX_MAX_CHANNEL_COUNT];
+  for (int ch = 0; ch < self->channel_count; ch++) channels[ch] = *samples + ch;
+  int err  = qoamax_decoder_read__impl(self, file_size, file, samples_size / self->channel_count, channels,
+                                       self->channel_count);
+  *samples = channels[0];
+  return err;
 }
 
 int qoamax_encoder_init(qoamax_encoder *restrict self, qoamax_encoder_effort effort, int channel_count,
@@ -1237,111 +1508,172 @@ int qoamax_encoder_init(qoamax_encoder *restrict self, qoamax_encoder_effort eff
   self->samplerate     = samplerate;
   self->frame_slices   = 0;
   self->header_written = false;
+  self->frame_index    = 0;
 
   for (int i = 0; i < channel_count; i++) {
     self->channels[i].lms              = QOAMAX_LMS_INITIAL;
     self->channels[i].error            = 0;
     self->channels[i].prev_scalefactor = 0;
+    for (int k = 0; k < 4; k++) self->group_weights[i][k] = 0, self->last_samples[i][k] = 0;
   }
 
   return 0;
 }
 
-static void qoamax_encoder_write_frame_header(const qoamax_encoder *restrict self, char *restrict *restrict out,
-                                              int samples_per_channel) {
+//! Starts a frame: writes the file header (along with the first frame, as a QOA file can't be empty), the frame
+//! header and the LMS state every channel starts with, which is stored in streams[ch].state.
+//!
+//! That is the state where the previous frame ended, with the weights truncated to int16 (the frame header stores them
+//! that way, and the decoder continues from the stored values). ULTRAFAST frames after the first group start from the
+//! weights at the end of the previous group and the last four input samples instead (see
+//! QOAMAX_ULTRAFAST_GROUP_FRAMES), which makes the frames of a group independent of each other.
+static void qoamax_encoder_start_frame(qoamax_encoder *restrict self, char *restrict *restrict out,
+                                       int samples_per_channel, qoamax__stream *streams) {
+  if (!self->header_written) qoamax__write_u64be(out, (uint64_t)QOAMAX_MAGIC << 32 | self->total_samples);
+  self->header_written = true;
+
   uint64_t frame_header = (uint64_t)self->channel_count << 56 | (uint64_t)self->samplerate << 32 |
                           (uint64_t)samples_per_channel << 16 |
                           qoamax__frame_size(self->channel_count, samples_per_channel);
   qoamax__write_u64be(out, frame_header);
 
+  bool restart = self->effort < 0 && self->frame_index >= QOAMAX_ULTRAFAST_GROUP_FRAMES;
   for (int ch = 0; ch < self->channel_count; ch++) {
-    const qoamax_lms *lms = &self->channels[ch].lms;
+    qoamax_encoder_channel *state = &streams[ch].state;
+    *state                        = self->channels[ch];
     uint64_t history = 0, weights = 0;
-    for (int i = 0; i < 4; i++) {
-      history = (history << 16) | (uint16_t)lms->history[i];
-      weights = (weights << 16) | (uint16_t)lms->weights[i];
+    for (int k = 0; k < 4; k++) {
+      if (restart) state->lms.history[k] = self->last_samples[ch][k];
+      state->lms.weights[k] = restart ? self->group_weights[ch][k] : (int16_t)state->lms.weights[k];
+      history               = (history << 16) | (uint16_t)state->lms.history[k];
+      weights               = (weights << 16) | (uint16_t)state->lms.weights[k];
     }
     qoamax__write_u64be(out, history);
     qoamax__write_u64be(out, weights);
   }
+  self->frame_index += 1;
 }
 
-//! Prepares encoding the next slice of every channel, writing the file and frame headers first if necessary.
-//! @returns whether the next slice can be encoded (false if the input or the output space runs out).
-static bool qoamax_encoder_begin_slice(qoamax_encoder *restrict self, char *restrict *restrict file,
-                                       const char *file_end, size_t samples_per_channel, bool samples_complete) {
-  if (self->frame_slices == 0) {
-    // The frame header holds the frame's sample count, so all its samples must be available (or the stream ends).
-    // The file header is only written along with the first frame, as a QOA file can't be empty.
-    if (samples_per_channel < QOAMAX_FRAME_SAMPLES && (!samples_complete || samples_per_channel == 0)) return false;
-    if (file_end - *file < 8 * (1 + 2 * self->channel_count) + (self->header_written ? 0 : 8)) return false;
-    if (!self->header_written) {
-      qoamax__write_u64be(file, (uint64_t)QOAMAX_MAGIC << 32 | self->total_samples);
-      self->header_written = true;
+//! The encoder of @ref qoamax_encoder_write and @ref qoamax_encoder_write_interleaved: the samples of channel ch are
+//! read from samples[ch], one every `stride` (the pointers are advanced past the encoded ones).
+//!
+//! The frames are encoded slice by slice, as far as the input and output allow, all channels at once. ULTRAFAST
+//! encodes the full frames of a group (except for the first one) at once, if they are available and fit into the
+//! output.
+//! @returns the number of samples per channel that were encoded.
+static size_t qoamax_encoder_write__impl(qoamax_encoder *restrict self, size_t file_size, char *restrict *restrict file,
+                                         size_t samples_per_channel, const int16_t *samples[], int stride,
+                                         bool samples_complete) {
+  int channel_count = self->channel_count;
+  size_t lookahead  = qoamax_encoder_effort_get_lookahead(self->effort);
+  char *file_end    = *file + file_size;
+  size_t remaining  = samples_per_channel;
+  qoamax__stream streams[QOAMAX_ULTRAFAST_GROUP_FRAMES * QOAMAX_MAX_CHANNEL_COUNT];
+
+  while (true) {
+    size_t samples_count;
+    if (self->frame_slices == 0) {
+      // The frame header holds the frame's sample count, so all its samples must be available (or the stream ends).
+      if (remaining < QOAMAX_FRAME_SAMPLES && (!samples_complete || remaining == 0)) break;
+      ptrdiff_t space = file_end - *file - (self->header_written ? 0 : 8);
+
+      // ULTRAFAST: the full frames of the current group that are available and fit into the output.
+      size_t frames = 0, frame_size = qoamax__frame_size(channel_count, QOAMAX_FRAME_SAMPLES);
+      if (self->effort < 0 && self->frame_index >= QOAMAX_ULTRAFAST_GROUP_FRAMES && space > 0) {
+        frames = QOAMAX_ULTRAFAST_GROUP_FRAMES - self->frame_index % QOAMAX_ULTRAFAST_GROUP_FRAMES;
+        frames = QOAMAX_MIN(frames, remaining / QOAMAX_FRAME_SAMPLES);
+        frames = QOAMAX_MIN(frames, (size_t)space / frame_size);
+      }
+
+      if (frames == 0) {
+        // Start a frame, which the next iterations encode slice by slice.
+        if (space < 8 * (1 + 2 * channel_count)) break;
+        int frame_samples = QOAMAX_MIN(remaining, QOAMAX_FRAME_SAMPLES);
+        qoamax_encoder_start_frame(self, file, frame_samples, streams);
+        for (int ch = 0; ch < channel_count; ch++) self->channels[ch] = streams[ch].state;
+        self->frame_slices = (frame_samples + 19) / 20;
+        continue;
+      }
+
+      for (size_t frame = 0; frame < frames; frame++) {
+        int16_t *frame_samples[QOAMAX_MAX_CHANNEL_COUNT];
+        for (int ch = 0; ch < channel_count; ch++) {
+          frame_samples[ch] = (int16_t *)samples[ch] + frame * QOAMAX_FRAME_SAMPLES * stride; // only read
+          if (frame > 0)
+            for (int k = 0; k < 4; k++) self->last_samples[ch][k] = frame_samples[ch][(k - 4) * stride];
+        }
+        qoamax__stream *frame_streams = &streams[frame * channel_count];
+        qoamax_encoder_start_frame(self, file, QOAMAX_FRAME_SAMPLES, frame_streams);
+        for (int ch = 0; ch < channel_count; ch++) frame_streams[ch].state.error = 0; // summed up below
+        qoamax__frame_streams(frame_streams, channel_count, *file, frame_samples, stride, QOAMAX_FRAME_SAMPLES,
+                              QOAMAX_FRAME_SAMPLES / 20);
+        *file += 8 * channel_count * (QOAMAX_FRAME_SAMPLES / 20);
+      }
+      qoamax__encode_streams(self->effort, streams, frames * channel_count);
+
+      // The channels continue from the last frame.
+      for (int ch = 0; ch < channel_count; ch++) {
+        uint64_t error = self->channels[ch].error;
+        for (size_t frame = 0; frame < frames; frame++) error += streams[frame * channel_count + ch].state.error;
+        self->channels[ch]       = streams[(frames - 1) * channel_count + ch].state;
+        self->channels[ch].error = error;
+      }
+      samples_count = frames * QOAMAX_FRAME_SAMPLES;
+    } else {
+      // As many slices of the current frame as the input (with lookahead) and output allow.
+      size_t slices = QOAMAX_MIN(self->frame_slices, (size_t)(file_end - *file) / (8 * channel_count));
+      if (samples_complete)
+        slices = QOAMAX_MIN(slices, (remaining + 19) / 20);
+      else
+        slices = remaining < lookahead ? 0 : QOAMAX_MIN(slices, (remaining - lookahead) / 20 + 1);
+      if (slices == 0) break;
+
+      qoamax__frame_streams(streams, channel_count, *file, (int16_t **)samples, stride, remaining, slices); // only read
+      for (int ch = 0; ch < channel_count; ch++) streams[ch].state = self->channels[ch];
+      qoamax__encode_streams(self->effort, streams, channel_count);
+      for (int ch = 0; ch < channel_count; ch++) self->channels[ch] = streams[ch].state;
+
+      *file += 8 * channel_count * slices;
+      self->frame_slices -= slices;
+      samples_count = QOAMAX_MIN(remaining, 20 * slices);
     }
 
-    int frame_samples  = QOAMAX_MIN(samples_per_channel, QOAMAX_FRAME_SAMPLES);
-    self->frame_slices = (frame_samples + 19) / 20;
+    for (int ch = 0; ch < channel_count; ch++) {
+      // Keep the last four samples for the next ULTRAFAST frame.
+      int16_t *last = self->last_samples[ch];
+      for (size_t i = samples_count - QOAMAX_MIN(samples_count, 4); i < samples_count; i++) {
+        last[0] = last[1], last[1] = last[2], last[2] = last[3];
+        last[3] = samples[ch][i * stride];
+      }
+      samples[ch] += samples_count * stride;
+    }
+    remaining -= samples_count;
 
-    // The file stores the LMS weights as int16. The encoder must continue from the same state as the decoder.
-    for (int ch = 0; ch < self->channel_count; ch++)
-      for (int i = 0; i < 4; i++) self->channels[ch].lms.weights[i] = (int16_t)self->channels[ch].lms.weights[i];
-
-    qoamax_encoder_write_frame_header(self, file, frame_samples);
+    // At the end of a group, store the LMS weights the next one starts with.
+    bool group_end = (self->frame_index - 1) % QOAMAX_ULTRAFAST_GROUP_FRAMES == QOAMAX_ULTRAFAST_GROUP_FRAMES - 1;
+    if (self->frame_slices == 0 && group_end)
+      for (int ch = 0; ch < channel_count; ch++)
+        for (int k = 0; k < 4; k++) self->group_weights[ch][k] = (int16_t)self->channels[ch].lms.weights[k];
   }
 
-  size_t min_samples = samples_complete ? 1 : qoamax_encoder_effort_get_lookahead(self->effort);
-  return file_end - *file >= 8 * self->channel_count && samples_per_channel >= min_samples;
+  return samples_per_channel - remaining;
 }
 
 int qoamax_encoder_write(qoamax_encoder *restrict self, size_t file_size, char *restrict *restrict file,
                          size_t samples_per_channel,
                          const int16_t *restrict samples[static restrict self->channel_count], bool samples_complete) {
-  size_t lookahead = qoamax_encoder_effort_get_lookahead(self->effort);
-  char *file_end   = *file + file_size;
-
-  while (qoamax_encoder_begin_slice(self, file, file_end, samples_per_channel, samples_complete)) {
-    int slice_size = QOAMAX_MIN(20, samples_per_channel);
-    for (int ch = 0; ch < self->channel_count; ch++) {
-      uint64_t slice = qoamax_encode_slice(&self->channels[ch], self->effort,
-                                           QOAMAX_MIN(lookahead, samples_per_channel), samples[ch]);
-      qoamax__write_u64be(file, slice);
-      samples[ch] += slice_size;
-    }
-
-    self->frame_slices -= 1;
-    samples_per_channel -= slice_size;
-  }
-
+  qoamax_encoder_write__impl(self, file_size, file, samples_per_channel, (const int16_t **)samples, 1,
+                             samples_complete);
   return 0;
 }
 
 int qoamax_encoder_write_interleaved(qoamax_encoder *restrict self, size_t file_size, char *restrict *restrict file,
                                      size_t samples_size, const int16_t *restrict samples[static restrict 1],
                                      bool samples_complete) {
-  if (self->channel_count == 1)
-    return qoamax_encoder_write(self, file_size, file, samples_size, samples, samples_complete);
-
-  size_t lookahead           = qoamax_encoder_effort_get_lookahead(self->effort);
-  size_t samples_per_channel = samples_size / self->channel_count;
-  char *file_end             = *file + file_size;
-
-  while (qoamax_encoder_begin_slice(self, file, file_end, samples_per_channel, samples_complete)) {
-    int slice_size           = QOAMAX_MIN(20, samples_per_channel);
-    int channel_samples_size = QOAMAX_MIN(lookahead, samples_per_channel);
-
-    for (int ch = 0; ch < self->channel_count; ch++) {
-      int16_t channel_samples[QOAMAX_MAX_LOOKAHEAD_SLICES * 20];
-      for (int i = 0; i < channel_samples_size; i++) channel_samples[i] = (*samples)[i * self->channel_count + ch];
-
-      uint64_t slice = qoamax_encode_slice(&self->channels[ch], self->effort, channel_samples_size, channel_samples);
-      qoamax__write_u64be(file, slice);
-    }
-
-    *samples += slice_size * self->channel_count;
-    self->frame_slices -= 1;
-    samples_per_channel -= slice_size;
-  }
-
+  const int16_t *channels[QOAMAX_MAX_CHANNEL_COUNT];
+  for (int ch = 0; ch < self->channel_count; ch++) channels[ch] = *samples + ch;
+  size_t encoded = qoamax_encoder_write__impl(self, file_size, file, samples_size / self->channel_count, channels,
+                                              self->channel_count, samples_complete);
+  *samples += encoded * self->channel_count;
   return 0;
 }

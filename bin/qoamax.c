@@ -651,11 +651,21 @@ static void progress_update(progress *self, uint64_t position, uint64_t error, i
 //                                   Codec                                   //
 ///////////////////////////////////////////////////////////////////////////////
 
-#define ENCODE_BUFFER_FRAMES (2 * QOAMAX_FRAME_SAMPLES + 80) //!< At least a frame plus the longest lookahead
-#define ENCODE_STEP_SLICES 32                                //!< Slices per channel encoded between progress updates
+//! Samples per channel in the input buffer: a group of ULTRAFAST frames (at least a frame) plus the longest lookahead.
+#define ENCODE_BUFFER_FRAMES (QOAMAX_ULTRAFAST_GROUP_FRAMES * QOAMAX_FRAME_SAMPLES + 80)
+#define ENCODE_STEP_SLICES 32 //!< Slices per channel encoded between progress updates
 //! Output bytes per encoding step: file header, frame header and LMS states, and ENCODE_STEP_SLICES slices.
 #define ENCODE_STEP_SIZE(channels) (8 * (2 + 2 * (channels)) + 8 * (channels) * ENCODE_STEP_SLICES)
-#define DECODE_BUFFER_FRAMES QOAMAX_FRAME_SAMPLES
+//! ULTRAFAST encodes a group of frames at once, if the output has room for them: file header and full frames (frame
+//! header, LMS states and slices).
+#define ULTRAFAST_STEP_SIZE(channels)                                                          \
+  (8 + QOAMAX_ULTRAFAST_GROUP_FRAMES * 8 * (1 + (channels) * (2 + QOAMAX_FRAME_SAMPLES / 20)))
+//! Samples (of all channels) in the output buffer: 16 full frames of a channel, which the library decodes at once (one
+//! frame of a channel per SIMD lane, see qoamax__decode_streams).
+#define DECODE_BUFFER_SAMPLES (16 * QOAMAX_FRAME_SAMPLES)
+//! Bytes in the QOA input buffer: room for the frames of one decoding step (DECODE_BUFFER_SAMPLES, about 33 KB) and
+//! more, so that it can be refilled before it holds less than that (see decode).
+#define DECODE_INPUT_SIZE (128 * 1024)
 
 //! Encodes the reader's audio into the output in fixed-size chunks.
 //! @returns the number of encoded samples per channel (0 on errors, which are reported), and their total squared
@@ -663,8 +673,14 @@ static void progress_update(progress *self, uint64_t position, uint64_t error, i
 static uint64_t encode(pcm_reader *reader, output *out, qoamax_encoder_effort effort, bool show_progress,
                        const char *title, uint64_t *total_error) {
   static int16_t samples[ENCODE_BUFFER_FRAMES * QOAMAX_MAX_CHANNEL_COUNT];
-  static char encoded[ENCODE_STEP_SIZE(QOAMAX_MAX_CHANNEL_COUNT)];
+  static char
+      encoded[QOAMAX_MAX(ENCODE_STEP_SIZE(QOAMAX_MAX_CHANNEL_COUNT), ULTRAFAST_STEP_SIZE(QOAMAX_MAX_CHANNEL_COUNT))];
   int channels = reader->channels;
+  // ULTRAFAST encodes a group of frames at once, if the output has room for them and their samples are available, so
+  // its buffer is refilled as soon as it holds less than a group.
+  bool ultrafast   = effort < 0;
+  size_t step_size = ultrafast ? ULTRAFAST_STEP_SIZE(channels) : ENCODE_STEP_SIZE(channels);
+  size_t refill_at = ultrafast ? QOAMAX_ULTRAFAST_GROUP_FRAMES * QOAMAX_FRAME_SAMPLES : 0;
 
   qoamax_encoder encoder;
   int err = qoamax_encoder_init(&encoder, effort, channels, reader->frames, reader->samplerate);
@@ -686,8 +702,7 @@ static uint64_t encode(pcm_reader *reader, output *out, qoamax_encoder_effort ef
     // The output is handed out in small steps, so that the progress display is updated regularly.
     char *encoded_end         = encoded;
     const int16_t *pos_before = pos;
-    err = qoamax_encoder_write_interleaved(&encoder, ENCODE_STEP_SIZE(channels), &encoded_end, end - pos, &pos,
-                                           input_complete);
+    err = qoamax_encoder_write_interleaved(&encoder, step_size, &encoded_end, end - pos, &pos, input_complete);
     if (err) {
       print_error("encoding failed: %s", library_error_string(err));
       return 0;
@@ -699,7 +714,7 @@ static uint64_t encode(pcm_reader *reader, output *out, qoamax_encoder_effort ef
     *total_error = 0;
     for (int i = 0; i < channels; i++) *total_error += errors[i];
     progress_update(&display, position, *total_error, channels);
-    if (encoded_end != encoded) continue;
+    if (encoded_end != encoded && (input_complete || (size_t)(end - pos) / channels >= refill_at)) continue;
 
     // The encoder needs more samples: move the remaining ones to the front of the buffer and refill it.
     if (input_complete) break;
@@ -728,7 +743,7 @@ typedef struct {
   input in;
   qoamax_decoder decoder;
   qoamax_decoder_query query;
-  unsigned char data[READ_CHUNK_SIZE];
+  unsigned char data[DECODE_INPUT_SIZE];
   const char *pos, *end; //!< The buffered data
   bool input_complete;
 } qoa_reader;
@@ -755,7 +770,7 @@ static bool qoa_reader_open(qoa_reader *reader, const char *path) {
 //! Decodes the QOA input into the output (WAV or raw PCM) in fixed-size chunks.
 //! @returns whether it succeeded (errors are reported), and the number of decoded samples per channel.
 static bool decode(qoa_reader *reader, output *out, pcm_format format, uint64_t *decoded_frames) {
-  static int16_t samples[DECODE_BUFFER_FRAMES * QOAMAX_MAX_CHANNEL_COUNT];
+  static int16_t samples[DECODE_BUFFER_SAMPLES];
   const qoamax_decoder_query *query = &reader->query;
 
   // The file header's sample count may be 0 (streaming) or wrong. The WAV header is updated at the end if needed.
@@ -765,29 +780,46 @@ static bool decode(qoa_reader *reader, output *out, pcm_format format, uint64_t 
   wav_build_header(header, query->channel_count, query->samplerate, header_data_size);
   if (format == FORMAT_WAV) fwrite(header, 1, sizeof header, out->file);
 
+  // The library decodes the whole frames that are in the input and fit into the output at once, in parallel (one frame
+  // of a channel per SIMD lane). Frames it can't complete, because the input or output ends inside them, are decoded
+  // slice by slice (2-3x slower). So the output has room for whole frames only, and the input is refilled while it
+  // still holds the frames of a step and one more (it always ends inside a frame).
+  int channels         = query->channel_count;
+  size_t step_frames   = QOAMAX_MAX(16 / channels, 1);
+  size_t step_samples  = step_frames * QOAMAX_FRAME_SAMPLES * channels;
+  size_t frame_size    = 8 * (1 + channels * (2 + QOAMAX_FRAME_SAMPLES / 20));
+  size_t refill_at     = (step_frames + 1) * frame_size;
+  bool needs_more_data = false;
+  // The largest refill_at is that of 8 channels (3 frames); refills should read at least as much.
+  static_assert(DECODE_INPUT_SIZE >= 2 * 3 * 8 * (1 + QOAMAX_MAX_CHANNEL_COUNT * (2 + QOAMAX_FRAME_SAMPLES / 20)));
+
   uint64_t frames = 0;
   while (!ferror(out->file)) {
+    // Refill the input: move the remaining bytes to the front of the buffer and read more.
+    size_t remaining = reader->end - reader->pos;
+    if (!reader->input_complete && (needs_more_data || remaining < refill_at)) {
+      memmove(reader->data, reader->pos, remaining);
+      size_t read = input_read(&reader->in, &reader->data[remaining], sizeof reader->data - remaining);
+      if (reader->in.failed) return false;
+      reader->pos            = (const char *)reader->data;
+      reader->end            = reader->pos + remaining + read;
+      reader->input_complete = read < sizeof reader->data - remaining;
+    }
+
     const char *pos_before = reader->pos;
     int16_t *samples_end   = samples;
-    int err                = qoamax_decoder_read_interleaved(&reader->decoder, reader->end - reader->pos, &reader->pos,
-                                                             DECODE_BUFFER_FRAMES * query->channel_count, &samples_end);
+    int err = qoamax_decoder_read_interleaved(&reader->decoder, reader->end - reader->pos, &reader->pos, step_samples,
+                                              &samples_end);
     if (err) {
       print_error("cannot decode: %s", library_error_string(err));
       return false;
     }
     write_s16le(out->file, samples, samples_end - samples);
-    frames += (samples_end - samples) / query->channel_count;
-    if (reader->pos != pos_before || samples_end != samples) continue;
+    frames += (samples_end - samples) / channels;
 
-    // The decoder needs more data: move the remaining bytes to the front of the buffer and refill it.
-    if (reader->input_complete) break;
-    size_t remaining = reader->end - reader->pos;
-    memmove(reader->data, reader->pos, remaining);
-    size_t read = input_read(&reader->in, &reader->data[remaining], sizeof reader->data - remaining);
-    if (reader->in.failed) return false;
-    reader->pos            = (const char *)reader->data;
-    reader->end            = reader->pos + remaining + read;
-    reader->input_complete = read < sizeof reader->data - remaining;
+    // Without progress, the decoder needs more data (or the file ends).
+    needs_more_data = reader->pos == pos_before && samples_end == samples;
+    if (needs_more_data && reader->input_complete) break;
   }
 
   *decoded_frames = frames;
@@ -845,6 +877,7 @@ static void print_usage(FILE *stream) {
                   "  qoamax encode [options] <input> <output.qoa>\n"
                   "  qoamax decode [options] <input.qoa> <output>\n"
                   "  qoamax --help\n"
+                  "  qoamax --version\n"
                   "\n"
                   "Commands:\n"
                   "  encode       Encode a WAV or raw PCM file into a QOA file\n"
@@ -1096,6 +1129,10 @@ int main(int argc, char **argv) {
   }
   if (strcmp(argv[1], "-h") == 0 || strcmp(argv[1], "--help") == 0) {
     print_usage(stdout);
+    return EXIT_SUCCESS;
+  }
+  if (strcmp(argv[1], "-v") == 0 || strcmp(argv[1], "--version") == 0) {
+    printf("qoamax %d.%d.%d\n", QOAMAX_VERSION_MAJOR, QOAMAX_VERSION_MINOR, QOAMAX_VERSION_PATCH);
     return EXIT_SUCCESS;
   }
 

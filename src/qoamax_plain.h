@@ -24,6 +24,11 @@ void qoamax_decode_slice(qoamax_lms *lms, uint64_t slice, int16_t out[20]);
 uint64_t qoamax_encode_slice(qoamax_encoder_channel *channel, qoamax_encoder_effort effort, int samples_size,
                              const int16_t *samples);
 
+void qoamax_encode_streams(qoamax_encoder_effort effort, size_t stream_count, qoamax_encode_stream *streams,
+                           bool samples_complete);
+
+void qoamax_decode_streams(size_t stream_count, qoamax_decode_stream *streams);
+
 static inline int qoamax_encoder_effort_get_lookahead(qoamax_encoder_effort effort) { return ((effort & 3) + 1) * 20; }
 
 ////////////////////

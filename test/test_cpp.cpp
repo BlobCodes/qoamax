@@ -102,6 +102,33 @@ int main() {
   qoamax_decode_slice(&lms, slice, samples);
   CHECK(std::memcmp(samples, decoded[0].data(), sizeof samples) == 0);
 
+  // The stream API: encode the interleaved samples (the first slice must match qoamax_encode_slice), decode them into
+  // interleaved samples, whose error must match the encoder's.
+  size_t slice_count = (count + 19) / 20;
+  std::vector<std::vector<uint64_t>> slices(channels, std::vector<uint64_t>(slice_count));
+  qoamax_encode_stream encode[channels];
+  for (int c = 0; c < channels; c++)
+    encode[c] = qoamax_encode_stream_init(&interleaved[c], count, channels, slices[c].data(), slice_count);
+  qoamax_encode_streams(QOAMAX_ENCODER_EFFORT_FAST, channels, encode, true);
+  CHECK(slices[0][0] == slice);
+  std::vector<int16_t> stream_decoded(channels * count);
+  qoamax_decode_stream decode[channels];
+  for (int c = 0; c < channels; c++) {
+    CHECK(encode[c].samples == &interleaved[c] + channels * count && encode[c].samples_size == 0);
+    CHECK(encode[c].slices == slices[c].data() + slice_count && encode[c].slices_size == 0);
+    decode[c] = qoamax_decode_stream_init(slices[c].data(), slice_count, &stream_decoded[c], count, channels);
+  }
+  qoamax_decode_streams(channels, decode);
+  for (int c = 0; c < channels; c++) {
+    CHECK(decode[c].samples_size == 0 && decode[c].slices_size == 0);
+    uint64_t error = 0;
+    for (uint32_t i = 0; i < count; i++) {
+      int64_t diff = stream_decoded[i * channels + c] - interleaved[i * channels + c];
+      error += (uint64_t)(diff * diff);
+    }
+    CHECK(error == encode[c].channel.error);
+  }
+
   if (failures) return 1;
   std::printf("test_cpp: all checks passed (qoamax %d.%d.%d)\n", QOAMAX_VERSION_MAJOR, QOAMAX_VERSION_MINOR,
               QOAMAX_VERSION_PATCH);

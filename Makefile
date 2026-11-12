@@ -31,11 +31,15 @@ TEST_CXXFLAGS := -std=c++11 -O1 -g -Wall -Wextra -pedantic-errors -Isrc \
 # same output. Lane counts above the target's vector width work too, the compiler splits the vectors.
 TEST_LANES := 1 2 4 8 16
 TEST_LIBS := $(BUILD_DIR)/test_lib $(foreach lanes,$(TEST_LANES),$(BUILD_DIR)/test_lib_lanes$(lanes))
+# A C23 compiler without GNU extensions (no __GNUC__), which builds the library without SIMD and builtins. Skipped if
+# it isn't installed. test/c23-include replaces <stdbit.h> and <stdckdint.h>, as glibc's and gcc's need GNU builtins.
+C23_CC := cproc
+C23_TEST := $(if $(shell command -v $(C23_CC) 2>/dev/null),test-c23)
 
 LIB_SOURCES := src/qoamax.h src/qoamax_plain.h src/qoamax.c src/qoamax_lanes.h src/qoamax_beam.h
 SHARED_LIB := $(BUILD_DIR)/libqoamax.so.$(VERSION)
 
-.PHONY: all debug release lib test test-build-systems install uninstall clean
+.PHONY: all debug release lib test test-c23 test-build-systems install uninstall clean
 
 all: debug release
 
@@ -45,8 +49,9 @@ release: $(BUILD_DIR)/qoamax
 
 lib: $(BUILD_DIR)/libqoamax.a $(SHARED_LIB)
 
-test: $(TEST_LIBS) $(BUILD_DIR)/test_cpp $(BUILD_DIR)/wavgen $(BUILD_DIR)/qoamax-debug
+test: $(TEST_LIBS) $(BUILD_DIR)/test_cpp $(BUILD_DIR)/wavgen $(BUILD_DIR)/qoamax-debug $(C23_TEST)
 	@for test in $(TEST_LIBS); do $$test || exit 1; done
+	$(if $(C23_TEST),,@echo "$(C23_CC) not found, skipping the test without GNU extensions")
 	$(BUILD_DIR)/test_cpp
 	@# The public header is C11 and C++11 without extensions (only qoamax.c needs C23), also without VLAs.
 	for compiler in "$(CC) -x c -std=c11" "$(CC) -x c -std=c11 -D__STDC_NO_VLA__=1 -Werror=vla" \
@@ -108,6 +113,13 @@ $(BUILD_DIR)/test_lib: test/test_lib.c test/signal.h $(LIB_SOURCES) | $(BUILD_DI
 
 $(BUILD_DIR)/test_lib_lanes%: test/test_lib.c test/signal.h $(LIB_SOURCES) | $(BUILD_DIR)
 	$(CC) $(TEST_CFLAGS) -DQOAMAX_LANES=$* test/test_lib.c -o $@ -lm
+
+test-c23: $(BUILD_DIR)/test_lib_c23
+	$(BUILD_DIR)/test_lib_c23
+
+$(BUILD_DIR)/test_lib_c23: test/test_lib.c test/signal.h test/c23-include/stdbit.h test/c23-include/stdckdint.h \
+                           $(LIB_SOURCES) | $(BUILD_DIR)
+	$(C23_CC) -std=c23 -Itest/c23-include test/test_lib.c -o $@ -lm -pthread
 
 # The C++ test links the library compiled as C.
 $(BUILD_DIR)/qoamax-test.o: $(LIB_SOURCES) | $(BUILD_DIR)

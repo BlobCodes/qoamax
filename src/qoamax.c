@@ -1,5 +1,15 @@
 #include "./qoamax.h"
+#include <stdckdint.h>
 #include <string.h>
+
+// <stdbit.h> is part of the C library (glibc since 2.39), which may be older than the compiler. gcc and clang get
+// __builtin_ctz instead (see qoamax__trailing_zeros).
+#if __has_include(<stdbit.h>) || !defined(__GNUC__)
+#include <stdbit.h>
+#define QOAMAX_HAS_STDBIT 1
+#else
+#define QOAMAX_HAS_STDBIT 0
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 //                        Core De-/Encoding Functions                        //
@@ -54,6 +64,16 @@ static const int16_t qoamax_qt[16][3] = {QOAMAX_DQT_ROWS(QOAMAX_QT_ROW)};
 
 #define qoamax_assume(x) ((x) ? (void)0 : unreachable())
 
+// A branch hint where the compiler has __builtin_expect (__has_builtin isn't part of C23).
+#if defined(__has_builtin)
+#if __has_builtin(__builtin_expect)
+#define QOAMAX_UNLIKELY(x) __builtin_expect((x), 0)
+#endif
+#endif
+#ifndef QOAMAX_UNLIKELY
+#define QOAMAX_UNLIKELY(x) (x)
+#endif
+
 #define QOAMAX_MIN(a, b) (((a) < (b)) ? (a) : (b))
 #define QOAMAX_MAX(a, b) (((a) > (b)) ? (a) : (b))
 
@@ -68,7 +88,7 @@ static const int16_t qoamax_qt[16][3] = {QOAMAX_DQT_ROWS(QOAMAX_QT_ROW)};
 //! Saturates the value to the int16 range. Clipping is rare, so a branch keeps the clamp off the dependency chain.
 [[gnu::always_inline]]
 static inline int32_t qoamax_clamp_s16(int32_t value) {
-  if (__builtin_expect((int16_t)value != value, 0)) value = value < 0 ? INT16_MIN : INT16_MAX;
+  if (QOAMAX_UNLIKELY((int16_t)value != value)) value = value < 0 ? INT16_MIN : INT16_MAX;
   return value;
 }
 
@@ -89,11 +109,22 @@ static inline uint64_t qoamax_error_squared_unclamped(int16_t actual, int32_t de
   return error;
 }
 
+//! Returns the number of trailing zero bits of a non-zero value.
+[[gnu::always_inline]]
+static inline int qoamax__trailing_zeros(unsigned value) {
+  qoamax_assume(value != 0);
+#if QOAMAX_HAS_STDBIT
+  return (int)stdc_trailing_zeros(value);
+#else
+  return __builtin_ctz(value);
+#endif
+}
+
 //! Returns a + b, saturating at UINT64_MAX.
 [[gnu::always_inline]]
 static inline uint64_t qoamax_add_saturating(uint64_t a, uint64_t b) {
   uint64_t sum;
-  return __builtin_add_overflow(a, b, &sum) ? UINT64_MAX : sum;
+  return ckd_add(&sum, a, b) ? UINT64_MAX : sum;
 }
 
 //! The LMS filter's state as local variables. The hot loops work on this copy instead of a qoamax_lms, which keeps
@@ -376,6 +407,20 @@ static uint64_t qoamax_encode_slice__hillclimb_scalefactor_search_scalar_unclamp
 // and RISC-V also for wider vector units, one variant per lane count, which is chosen at runtime by the CPU's features
 // (function multi-versioning, see qoamax__lanes_supported). Defining QOAMAX_LANES or QOAMAX_DISPATCH=0 builds only
 // one variant.
+//
+// SIMD and dispatch use GNU C extensions (vector types, __builtin_cpu_supports, target attributes), which gcc and
+// clang (and compilers based on them) indicate by defining __GNUC__. Other C23 compilers get the scalar code only.
+#ifndef __GNUC__
+#if defined(QOAMAX_LANES) && QOAMAX_LANES > 1
+#error "QOAMAX_LANES > 1 needs GNU C vector extensions"
+#endif
+#undef QOAMAX_DISPATCH
+#define QOAMAX_DISPATCH 0
+#ifndef QOAMAX_LANES
+#define QOAMAX_LANES 1
+#endif
+#endif
+
 #ifndef QOAMAX_DISPATCH
 #ifdef QOAMAX_LANES
 #define QOAMAX_DISPATCH 0
@@ -722,7 +767,7 @@ static inline int qoamax_encode_beam_search_small(const qoamax_beam_node *restri
         }
 
         for (; candidates; candidates &= candidates - 1) {
-          int codepoint      = __builtin_ctz(candidates);
+          int codepoint      = qoamax__trailing_zeros(candidates);
           uint64_t new_error = new_errors[codepoint];
           // the bound may have decreased in the meantime
           if (new_error < beam.max_error)
@@ -814,7 +859,7 @@ static inline int qoamax_encode_beam_search_impl(const qoamax_beam_node *restric
       }
 
       for (; candidates; candidates &= candidates - 1) {
-        int codepoint      = __builtin_ctz(candidates);
+        int codepoint      = qoamax__trailing_zeros(candidates);
         uint64_t new_error = new_errors[codepoint];
         if (new_error >= max_error) continue; // the bound may have decreased in the meantime
 

@@ -4,44 +4,35 @@ QOAMAX is an encoder + decoder implementation for the QOA codec and file format,
 usable as a library inside other applications as well as a standalone CLI tool.
 
 The library can be used stand-alone without any dependencies or even memory allocations,
-but requires a recent gcc or clang (C23 with GNU extensions, see [Compiler support](#compiler-support)).
+and compiles with any C23 compiler, including cproc. With gcc or clang it also uses SIMD
+(see [Compiler support](#compiler-support)).
 
-QOAMAX features more optimized encoder/decoder implementations,
-often resulting in a 2x performance increase over qoaconv.
+QOAMAX features an optimized decoder implementation tuned for various SIMD extensions (2.5x on a Ryzen 5900X).
 
-QOAMAX implements multiple parametrizable encoders,
-ranging from being 5x as fast as the reference encoder to
-trading hours of compute for large quality improvements.
-
+QOAMAX implements multiple parametrizable, optimized encoders, from highly performant to high-quality.  
 On a pop song, the tradeoff currently looks like this (Ryzen 5900X, placebo and ultrafast missing):  
 ![Graph showing the speed-quality tradeoff](assets/qoa_pareto.svg)
 
 ## Compilation
 
-Simply run `make` inside the repo root to build the CLI tool.
-This builds the optimized `build/qoamax` and a sanitizer-enabled `build/qoamax-debug`;
-use `make release` to only build `build/qoamax`, and `make test` to run the tests.
-`make lib` builds the static and shared library (`build/libqoamax.a`, `build/libqoamax.so`), and
+TLDR:
+```bash
+$ git clone https://gitlab.com/BlobCodes/qoamax.git
+$ make # builds build/qoamax
+$ make install # installs into PREFIX
+```
+
+Run `make` inside the repo root to build the CLI tool.
+This builds the optimized `build/qoamax` and a sanitizer-enabled `build/qoamax-debug`.
+
+Use `make release` to only build `build/qoamax`, use `make test` to run the tests.
+
 `make install` installs the CLI, the library, its headers and a pkg-config file (`PREFIX=/usr/local`, `DESTDIR`).
-CMake and Meson builds work too, see [Using the library](#using-the-library).
 
-Notice that some encoder implementations are noticeably faster when compiled with clang
-instead of gcc.
+`make lib` builds the static and shared library (`build/libqoamax.a`, `build/libqoamax.so`).
+CMake and Meson can be used to include the library too, see [Using the library](#using-the-library).
 
-### Compiler support
-
-The library's source (`src/qoamax.c`) is C23 and also uses GNU extensions, without fallbacks, so it needs gcc or clang
-(tested with gcc 16 and clang 23; older versions with C23 support may work):
-
-- builtins: `__builtin_expect`, `__builtin_ctz`, `__builtin_add_overflow` and `__builtin_cpu_supports`
-  (runtime SIMD detection),
-- vector extensions (`__attribute__((vector_size))`) for the SIMD encoder searches,
-- `[[gnu::...]]` attributes such as `always_inline`, `noinline` and `target` (SIMD variants of functions),
-- variably modified (VLA) parameters, e.g. `samples[static restrict samples_count]`. They are standard in C23, but
-  compilers without full C23 support may lack them (they were optional in C11).
-
-MSVC can't compile it; clang-cl should work, but is untested. The public header `src/qoamax.h` has none of these
-requirements: it is plain C11 and C++11.
+**Notice that the library is noticeably faster when compiled with clang instead of gcc.**
 
 ## Usage
 
@@ -70,10 +61,11 @@ $ qoamax decode input.qoa - | ffmpeg -i - output.flac
 
 ## Using the library
 
-The library has no dependencies and doesn't allocate memory. It consists of `src/qoamax.c`, which needs gcc or clang
-(see [Compiler support](#compiler-support); clang is faster), and the header `src/qoamax.h`, which is plain C11 and
-C++11, so the rest of your project can use any compiler and standard from those on. Build the library with
-optimizations: the encoder is many times slower without them.
+The library has no dependencies and doesn't allocate memory.
+It consists of `src/qoamax.c`, which needs a C23 compiler,
+and the header `src/qoamax.h`, which is plain C11/C++11,
+so the rest of your project can use any compiler and standard from those on.
+Build the library with optimizations: the encoder is many times slower without them.
 
 **Copy the source** into your project: `src/qoamax.h`, `src/qoamax_plain.h` (plain declarations for C++ and C
 compilers without VLA parameters, included by `qoamax.h`), `src/qoamax.c`, `src/qoamax_lanes.h` and
@@ -112,26 +104,24 @@ symbols from a DLL.
 **Installed** (by `make install`, CMake or Meson): `pkg-config --cflags --libs qoamax`.
 Before version 1.0, every minor version may change the ABI (the shared library's soname is `libqoamax.so.0.1`).
 
-### Example
+## Compiler support
 
-Encoding interleaved 16-bit samples into a memory buffer (the whole program, which decodes it again, is
-[`test/example.c`](test/example.c)):
+The library's source (`src/qoamax.c`) is standard C23 and compiles with any C23 compiler (tested with gcc 16,
+clang 23 and [cproc](https://sr.ht/~mcf/cproc/); older gcc/clang versions with C23 support may work). It needs no
+library functions besides `memcpy`, and uses the C23 headers `<stdckdint.h>` and `<stdbit.h>` (if the C library
+lacks `<stdbit.h>`, gcc and clang use a builtin instead).
 
-```c
-#include <qoamax.h>
+gcc and clang (and other compilers defining `__GNUC__`) also get the fast paths, which use GNU extensions:
 
-size_t size = qoamax_encoder_get_encoded_size(channels, count); // count = samples per channel
-char *file  = malloc(size);
-qoamax_encoder encoder;
-if (qoamax_encoder_init(&encoder, QOAMAX_ENCODER_EFFORT_MEDIUM, channels, count, samplerate) != 0) return 1;
-char *out         = file;
-const int16_t *in = samples;
-if (qoamax_encoder_write_interleaved(&encoder, size, &out, count * channels, &in, true) != 0) return 1;
-// out - file bytes were written.
-```
+- vector extensions (`__attribute__((vector_size))`) for the SIMD encoder searches (SSE2/AVX2/AVX-512, NEON, SVE,
+  RVV), and `__builtin_cpu_supports` with `[[gnu::target]]` functions for choosing AVX2/AVX-512 at runtime,
+- `[[gnu::always_inline]]`/`[[gnu::noinline]]`, `#pragma GCC unroll` and `__builtin_expect` as optimizer hints.
 
-The encoder and decoder functions advance the buffer pointers to report their progress, and return when the input
-or output runs out (0 = OK, negative values are `QOAMAX_ERROR_*` codes), so they can also stream in chunks.
-`qoamax_encoder_write` and `qoamax_decoder_read` take one buffer per channel instead of interleaved samples, and
-`qoamax_encode_slice`/`qoamax_decode_slice` encode/decode single 20-sample slices for custom formats.
-See [`src/qoamax.h`](src/qoamax.h) for the documentation.
+Other compilers ignore the attributes and pragmas, and build only the scalar code. The output is the same, but the
+encoder may be much slower: the hot loops are tuned for clang and gcc. Note that the C23 headers must suit the
+compiler: with cproc, glibc's `<stdbit.h>` and gcc's `<stdckdint.h>` don't work, as they use GNU builtins (the tests
+use the replacements in `test/c23-include`).
+
+The C23 features include variably modified (VLA) parameters, e.g. `samples[static restrict samples_count]`, which
+compilers without full C23 support may lack (they were optional in C11). MSVC can't compile it; clang-cl should
+work, but is untested. The public header `src/qoamax.h` has none of these requirements: it is plain C11 and C++11.

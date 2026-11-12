@@ -8,6 +8,7 @@
 #include "../src/qoamax.c"
 #include "signal.h"
 
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -164,7 +165,7 @@ static void test_efforts(bool print_checksums) {
     if (print_checksums) {
       printf("    {\"%s\", ..., 0x%016llX, 0x%016llX}, // PSNR %.2f dB\n", effort_cases[i].name,
              (unsigned long long)encoded_checksum, (unsigned long long)decoded_checksum,
-             error ? 10 * __builtin_log10(32767.0 * 32767.0 * frames * channels / error) : 999.0);
+             error ? 10 * log10(32767.0 * 32767.0 * frames * channels / error) : 999.0);
     } else {
       CHECK(encoded_checksum == effort_cases[i].encoded_checksum,
             "%s: the encoded output changed (checksum 0x%016llX). If intended, see --print-checksums",
